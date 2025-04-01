@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Force gcc/g++ before project declaration
-set(CMAKE_C_COMPILER "/usr/local/bin/gcc-14" CACHE STRING "C compiler" FORCE)
-set(CMAKE_CXX_COMPILER "/usr/local/bin/g++-14" CACHE STRING "C++ compiler" FORCE)
+# set(CMAKE_C_COMPILER "/usr/local/bin/gcc-14" CACHE STRING "C compiler" FORCE)
+# set(CMAKE_CXX_COMPILER "/usr/local/bin/g++-14" CACHE STRING "C++ compiler" FORCE)
 
 project(Mini2)
 
