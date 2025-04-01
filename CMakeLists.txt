@@ -2,7 +2,16 @@ cmake_minimum_required(VERSION 3.10)
 
 # Force gcc/g++ before project declaration
 # set(CMAKE_C_COMPILER "/usr/local/bin/gcc-14" CACHE STRING "C compiler" FORCE)
-# set(CMAKE_CXX_COMPILER "/usr/local/bin/g++-14" CACHE STRING "C++ compiler" FORCE)
+#set(CMAKE_CXX_COMPILER "/usr/local/bin/g++-14" CACHE STRING "C++ compiler" FORCE)
+
+# Force CMake to use Homebrew's Clang before declaring the project
+# set(CMAKE_C_COMPILER "/usr/local/opt/llvm/bin/clang" CACHE STRING "C compiler" FORCE)
+# set(CMAKE_CXX_COMPILER "/usr/local/opt/llvm/bin/clang++" CACHE STRING "C++ compiler" FORCE)
+
+# Set LLVM Clang-specific flags
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -nostdinc++ -I/usr/local/opt/llvm/include/c++/v1")
+# set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/usr/local/opt/llvm/lib -Wl,-rpath,/usr/local/opt/llvm/lib")
+
 
 project(Mini2)
 
@@ -71,70 +80,55 @@ add_custom_target(generate_proto_files
 )
 
 # Server source files
-set(SERVER_A_SRC
-    cpp/src/server_a.cpp
+set(SERVER_SRC
+    cpp/src/server.cpp
     cpp/src/parser/CSV.cpp
     ${mini2_proto_srcs}
     ${mini2_grpc_srcs}
 )
 
-# Create executables for each server
-add_executable(server_a ${SERVER_A_SRC})
-add_dependencies(server_a generate_proto_files)
-
-add_executable(server_b cpp/src/server_b.cpp ${SERVER_A_SRC})
-add_dependencies(server_b generate_proto_files)
-
-add_executable(server_c cpp/src/server_c.cpp ${SERVER_A_SRC})
-add_dependencies(server_c generate_proto_files)
-
-add_executable(server_d cpp/src/server_d.cpp ${SERVER_A_SRC})
-add_dependencies(server_d generate_proto_files)
-
-add_executable(server_e cpp/src/server_e.cpp ${SERVER_A_SRC})
-add_dependencies(server_e generate_proto_files)
+add_executable(server ${SERVER_SRC})
+add_dependencies(server generate_proto_files)
 
 # Link libraries
-foreach(server server_a server_b server_c server_d server_e)
-    target_link_libraries(${server} PRIVATE
-        gRPC::grpc++
-        gRPC::grpc++_reflection
-        protobuf::libprotobuf
-        absl::flags
-        absl::flags_parse
-        absl::flags_reflection
-        absl::base
-        absl::log
-        absl::log_initialize
-        absl::log_entry
-        absl::log_globals
-        absl::log_severity
-        absl::check
-        absl::log_internal_check_op
-        absl::log_internal_conditions
-        absl::log_internal_format
-        absl::log_internal_globals
-        absl::log_internal_log_sink_set
-        absl::log_internal_message
-        absl::log_internal_nullguard
-        absl::log_internal_proto
-        absl::log_sink
-        absl::log_sink_registry
-        absl::cord
-        absl::cordz_info
-        absl::cord_internal
-        absl::strings
-        absl::strings_internal
-        absl::symbolize
-        absl::stacktrace
-        absl::synchronization
-        absl::time
-        absl::time_zone
-        absl::status
-        absl::statusor
-        Threads::Threads
-    )
-endforeach()
+target_link_libraries(server PRIVATE
+    gRPC::grpc++
+    gRPC::grpc++_reflection
+    protobuf::libprotobuf
+    absl::flags
+    absl::flags_parse
+    absl::flags_reflection
+    absl::base
+    absl::log
+    absl::log_initialize
+    absl::log_entry
+    absl::log_globals
+    absl::log_severity
+    absl::check
+    absl::log_internal_check_op
+    absl::log_internal_conditions
+    absl::log_internal_format
+    absl::log_internal_globals
+    absl::log_internal_log_sink_set
+    absl::log_internal_message
+    absl::log_internal_nullguard
+    absl::log_internal_proto
+    absl::log_sink
+    absl::log_sink_registry
+    absl::cord
+    absl::cordz_info
+    absl::cord_internal
+    absl::strings
+    absl::strings_internal
+    absl::symbolize
+    absl::stacktrace
+    absl::synchronization
+    absl::time
+    absl::time_zone
+    absl::status
+    absl::statusor
+    Threads::Threads
+)
 
 # Make sure include_directories includes the cpp/include directory
 include_directories(
