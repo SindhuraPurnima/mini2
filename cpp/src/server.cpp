@@ -12,6 +12,7 @@
 #include "proto/mini2.grpc.pb.h"
 #include "proto/mini2.pb.h"
 #include "parser/CSV.h"
+#include "SpatialAnalysis.h"  // Add this include for query functionality
 
 using json = nlohmann::json;
 using grpc::Server;
@@ -79,6 +80,10 @@ private:
     
     // Keep track of node count to help with distribution
     int total_node_count;
+    
+    // Add SpatialAnalysis instance and local data storage
+    SpatialAnalysis spatialAnalysis;
+    std::vector<CSVRow> localCollisionData;
     
     // Initialize shared memory for a specific connection
     bool initSharedMemory(const std::string& connection_id, int key, size_t size) {
@@ -151,25 +156,25 @@ private:
         
         // Try up to 5 times with increasing delays
         for (int attempt = 0; attempt < 5; attempt++) {
-            // Check if there's space in the buffer
+        // Check if there's space in the buffer
             if (control->data_count < (shm.size / sizeof(CollisionData))) {
-                // Get pointer to data area (after control structure)
-                char* data_area = static_cast<char*>(shm.memory) + sizeof(SharedMemoryControl);
-                
-                // Serialize the data to the appropriate position
-                std::string serialized_data;
-                data.SerializeToString(&serialized_data);
-                
-                // Copy serialized data to shared memory
-                std::memcpy(data_area + control->write_index * sizeof(CollisionData), 
-                           serialized_data.data(), 
-                           std::min(serialized_data.size(), sizeof(CollisionData)));
-                
-                // Update control structure
-                control->write_index = (control->write_index + 1) % (shm.size / sizeof(CollisionData));
-                control->data_count++;
-                
-                return true;
+        // Get pointer to data area (after control structure)
+        char* data_area = static_cast<char*>(shm.memory) + sizeof(SharedMemoryControl);
+        
+        // Serialize the data to the appropriate position
+        std::string serialized_data;
+        data.SerializeToString(&serialized_data);
+        
+        // Copy serialized data to shared memory
+        std::memcpy(data_area + control->write_index * sizeof(CollisionData), 
+                   serialized_data.data(), 
+                   std::min(serialized_data.size(), sizeof(CollisionData)));
+        
+        // Update control structure
+        control->write_index = (control->write_index + 1) % (shm.size / sizeof(CollisionData));
+        control->data_count++;
+        
+        return true;
             }
             
             // Buffer is full, log only on first attempt to avoid spam
@@ -392,8 +397,57 @@ private:
         std::cout << "--- End of Network Analysis ---\n\n";
     }
 
+    // Convert CollisionData (protobuf) to CSVRow for analysis
+    CSVRow convertToCSVRow(const CollisionData& data) {
+        CSVRow row;
+        row.crash_date = data.crash_date();
+        row.crash_time = data.crash_time();
+        row.borough = data.borough();
+        row.zip_code = data.zip_code().empty() ? 0 : std::stoi(data.zip_code());
+        row.latitude = data.latitude();
+        row.longitude = data.longitude();
+        row.location = data.location();
+        row.on_street_name = data.on_street_name();
+        row.cross_street_name = data.cross_street_name();
+        row.off_street_name = data.off_street_name();
+        row.persons_injured = data.number_of_persons_injured();
+        row.persons_killed = data.number_of_persons_killed();
+        row.pedestrians_injured = data.number_of_pedestrians_injured();
+        row.pedestrians_killed = data.number_of_pedestrians_killed();
+        row.cyclists_injured = data.number_of_cyclist_injured();
+        row.cyclists_killed = data.number_of_cyclist_killed();
+        row.motorists_injured = data.number_of_motorist_injured();
+        row.motorists_killed = data.number_of_motorist_killed();
+        
+        // Additional fields would be set here
+        return row;
+    }
+    
+    // Process local data using SpatialAnalysis
+    void processLocalData() {
+        if (localCollisionData.empty()) {
+            std::cout << "No local data to analyze on server " << server_id << std::endl;
+            return;
+        }
+        
+        std::cout << "\n--- PERFORMING SPATIAL ANALYSIS ON SERVER " << server_id << " ---\n";
+        std::cout << "Processing " << localCollisionData.size() << " collision records\n";
+        
+        // Process the data with SpatialAnalysis
+        spatialAnalysis.processCollisions(localCollisionData);
+        
+        // Identify and print high-risk areas
+        spatialAnalysis.identifyHighRiskAreas();
+        
+        std::cout << "--- END OF SPATIAL ANALYSIS ---\n\n";
+    }
+
 public:
-    GenericServer(const std::string& config_path) : is_entry_point(false) {
+    GenericServer(const std::string& config_path) 
+        : is_entry_point(false),
+          // Initialize SpatialAnalysis with thresholds for injuries and deaths
+          spatialAnalysis(10, 2)  // 10 injuries or 2 deaths to mark area high-risk
+    {
         // Load configuration from JSON file
         std::ifstream config_file(config_path);
         if (!config_file.is_open()) {
@@ -476,6 +530,9 @@ public:
     }
     
     ~GenericServer() {
+        // Run final spatial analysis on locally stored data
+        processLocalData();
+        
         // Clean up shared memory
         for (auto& shm_pair : shared_memories) {
             if (shm_pair.second.memory != nullptr && shm_pair.second.memory != (void*)-1) {
@@ -516,6 +573,10 @@ public:
             
             if (keep_locally) {
                 records_kept_locally++;
+                
+                // Convert and store for SpatialAnalysis
+                localCollisionData.push_back(convertToCSVRow(collision));
+                
                 // No target server, store locally
                 if (count % 100 == 0) {
                     std::cout << "Data kept locally on entry point server" << std::endl;
@@ -539,7 +600,7 @@ public:
                     writeToSharedMemory(target_server, collision)) {
                     // Successfully used shared memory
                     if (count % 500 == 0) {  // Reduce log spam
-                        std::cout << "Data written to shared memory for " << target_server << std::endl;
+                    std::cout << "Data written to shared memory for " << target_server << std::endl;
                     }
                 } else {
                     // Use gRPC
@@ -567,8 +628,9 @@ public:
             std::cout << "  Sent to " << stat.first << ": " << stat.second << " records" << std::endl;
         }
         
-        // At the end of the method, after processing all records:
+        // Report distribution stats and perform analysis after processing all records
         reportDistributionStats();
+        processLocalData();
         
         return Status::OK;
     }
@@ -583,6 +645,9 @@ public:
         // Increment the total records counter for ALL received records
         total_records_seen += batch_size;
         
+        // Track records for analysis
+        int kept_locally_in_batch = 0;
+        
         // Process each collision in the batch
         for (int i = 0; i < batch_size; i++) {
             const CollisionData& collision = batch->collisions(i);
@@ -591,8 +656,12 @@ public:
             if (shouldKeepLocally(collision)) {
                 // Store the data locally
                 records_kept_locally++;
+                kept_locally_in_batch++;
+                
+                // Convert and store for SpatialAnalysis
+                localCollisionData.push_back(convertToCSVRow(collision));
+                
                 std::cout << "Keeping record locally based on content hash" << std::endl;
-                // Add your storage logic here
                 continue;
             }
             
@@ -615,11 +684,16 @@ public:
             }
         }
         
-        // Periodically report stats (e.g., every 10 batches)
+        // Periodically report stats and run analysis (e.g., every 10 batches)
         static int batch_count = 0;
         batch_count++;
         if (batch_count % 10 == 0) {
             reportDistributionStats();
+            
+            // Perform spatial analysis periodically if we have enough data
+            if (localCollisionData.size() >= 100) {
+                processLocalData();
+            }
         }
         
         return Status::OK;
