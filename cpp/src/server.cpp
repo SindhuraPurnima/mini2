@@ -70,6 +70,14 @@ private:
     // Data processing state
     bool is_entry_point;
     
+    // Add counters for data distribution tracking
+    int total_records_seen = 0;
+    int records_kept_locally = 0;
+    std::map<std::string, int> records_forwarded;
+    
+    // Keep track of node count to help with distribution
+    int total_node_count;
+    
     // Initialize shared memory for a specific connection
     bool initSharedMemory(const std::string& connection_id, int key, size_t size) {
         SharedMemorySegment shm;
@@ -201,20 +209,175 @@ private:
         return true;
     }
     
-    // Choose which server to forward data to
-    std::string chooseTargetServer(const CollisionData& data) {
-        // Implement your routing logic here
-        // This is a simple round-robin example
-        static size_t next_server_index = 0;
+    // Enhanced method to decide whether to keep data locally or forward it
+    bool shouldKeepLocally(const CollisionData& data) {
+        // Each server should keep approximately 1/N of the data
+        // where N is the total number of servers in the network
+        total_node_count = network_nodes.size();
         
-        if (connections.empty()) {
-            return "";
+        // Use a consistent hash of the data to determine which node should keep it
+        std::string key = data.borough() + data.zip_code() + 
+                          data.on_street_name() + data.cross_street_name();
+        size_t hash_value = std::hash<std::string>{}(key);
+        
+        // Map hash to server index (0 to total_node_count-1)
+        int target_node_index = hash_value % total_node_count;
+        
+        // Get ordered list of server IDs
+        std::vector<std::string> ordered_nodes;
+        for (const auto& node_pair : network_nodes) {
+            ordered_nodes.push_back(node_pair.first);
         }
         
-        std::string target = connections[next_server_index];
-        next_server_index = (next_server_index + 1) % connections.size();
+        // Sort to ensure consistent ordering across all servers
+        std::sort(ordered_nodes.begin(), ordered_nodes.end());
         
-        return target;
+        // If this node's index matches the target, keep the data
+        for (size_t i = 0; i < ordered_nodes.size(); i++) {
+            if (ordered_nodes[i] == server_id && i == target_node_index) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    // Improved routing logic based on the overlay network
+    std::string chooseTargetServer(const CollisionData& data) {
+        total_records_seen++;
+        
+        // First check if this server should keep the data
+        if (shouldKeepLocally(data)) {
+            records_kept_locally++;
+            return ""; // Empty string means keep locally
+        }
+        
+        // If we need to forward, determine the best path to the target
+        // Find the target node that should ultimately store this data
+        std::string key = data.borough() + data.zip_code() + 
+                          data.on_street_name() + data.cross_street_name();
+        size_t hash_value = std::hash<std::string>{}(key);
+        
+        // Determine target node ID
+        std::vector<std::string> ordered_nodes;
+        for (const auto& node_pair : network_nodes) {
+            ordered_nodes.push_back(node_pair.first);
+        }
+        std::sort(ordered_nodes.begin(), ordered_nodes.end());
+        
+        int target_node_index = hash_value % total_node_count;
+        std::string target_node_id = ordered_nodes[target_node_index];
+        
+        // If target is directly connected to us, send directly
+        for (const auto& conn : connections) {
+            if (conn == target_node_id) {
+                records_forwarded[conn]++;
+                return conn;
+            }
+        }
+        
+        // Otherwise, find the best next hop based on our overlay network
+        // For simplicity in this implementation, just use the first connection
+        // In a more sophisticated implementation, you'd use graph algorithms to find the shortest path
+        if (!connections.empty()) {
+            std::string next_hop = connections[0];
+            records_forwarded[next_hop]++;
+            return next_hop;
+        }
+        
+        return ""; // If no connections, we have to keep it locally
+    }
+    
+    // Add method to report data distribution statistics
+    void reportDistributionStats() {
+        std::cout << "\n--- DATA DISTRIBUTION STATISTICS ---\n";
+        std::cout << "Total records seen: " << total_records_seen << std::endl;
+        
+        if (total_records_seen > 0) {
+            double keep_percentage = (records_kept_locally * 100.0) / total_records_seen;
+            std::cout << "Records kept locally: " << records_kept_locally 
+                      << " (" << keep_percentage << "%)" << std::endl;
+            
+            std::cout << "Records forwarded:" << std::endl;
+            for (const auto& stat : records_forwarded) {
+                double forward_percentage = (stat.second * 100.0) / total_records_seen;
+                std::cout << "  To " << stat.first << ": " << stat.second 
+                          << " (" << forward_percentage << "%)" << std::endl;
+            }
+            
+            // Ideal distribution would be each node handling 1/N of the data
+            double ideal_percentage = 100.0 / total_node_count;
+            std::cout << "Ideal distribution: " << ideal_percentage << "% per node" << std::endl;
+        }
+        
+        std::cout << "--- END STATISTICS ---\n\n";
+    }
+
+    // Add a method to analyze network topology
+    void analyzeNetworkTopology() {
+        std::cout << "\n--- Network Topology Analysis for Server " << server_id << " ---\n";
+        
+        // Determine node types in the network
+        std::set<std::string> entry_points;
+        std::set<std::string> intermediary_nodes;
+        std::set<std::string> leaf_nodes;
+        
+        // Count incoming connections for each node
+        std::map<std::string, int> incoming_connections;
+        
+        // Initialize counts
+        for (const auto& node_pair : network_nodes) {
+            incoming_connections[node_pair.first] = 0;
+        }
+        
+        // Count incoming connections
+        for (const auto& node_pair : network_nodes) {
+            for (const auto& conn : node_pair.second.connections) {
+                incoming_connections[conn]++;
+            }
+        }
+        
+        // Classify nodes
+        for (const auto& node_pair : network_nodes) {
+            const std::string& node_id = node_pair.first;
+            const auto& connections = node_pair.second.connections;
+            
+            if (node_pair.second.id == server_id && is_entry_point) {
+                entry_points.insert(node_id);
+            } else if (connections.empty()) {
+                leaf_nodes.insert(node_id);
+            } else {
+                intermediary_nodes.insert(node_id);
+            }
+        }
+        
+        // Log topology information
+        std::cout << "  Entry points: ";
+        for (const auto& node : entry_points) std::cout << node << " ";
+        std::cout << "\n";
+        
+        std::cout << "  Intermediary nodes: ";
+        for (const auto& node : intermediary_nodes) std::cout << node << " ";
+        std::cout << "\n";
+        
+        std::cout << "  Leaf nodes: ";
+        for (const auto& node : leaf_nodes) std::cout << node << " ";
+        std::cout << "\n";
+        
+        std::cout << "  Connection map:\n";
+        for (const auto& node_pair : network_nodes) {
+            std::cout << "    " << node_pair.first << " → ";
+            if (node_pair.second.connections.empty()) {
+                std::cout << "(endpoint)";
+            } else {
+                for (const auto& conn : node_pair.second.connections) {
+                    std::cout << conn << " ";
+                }
+            }
+            std::cout << " (incoming: " << incoming_connections[node_pair.first] << ")\n";
+        }
+        
+        std::cout << "--- End of Network Analysis ---\n\n";
     }
 
 public:
@@ -258,15 +421,30 @@ public:
             }
         }
         
+        // Analyze the network topology to understand the structure
+        analyzeNetworkTopology();
+        
         // Initialize shared memory for each connection
         int base_key = 1000;  // Starting key for shared memory
         for (size_t i = 0; i < connections.size(); i++) {
+            std::string conn_id = connections[i];
+            
+            // Determine if the connection is on the same machine
+            bool is_local = (network_nodes[conn_id].address == "127.0.0.1" || 
+                            network_nodes[conn_id].address == "localhost");
+            
+            // If not local, skip shared memory setup
+            if (!is_local) {
+                std::cout << "Connection to " << conn_id << " is remote, using gRPC only." << std::endl;
+                continue;
+            }
+            
             // Use a different key for each connection
             int key = base_key + i;
             // 1MB shared memory segment for each connection
-            if (!initSharedMemory(connections[i], key, 1024 * 1024)) {
-                std::cerr << "Failed to initialize shared memory for " << connections[i] << std::endl;
-                exit(1);
+            if (!initSharedMemory(conn_id, key, 1024 * 1024)) {
+                std::cerr << "Failed to initialize shared memory for " << conn_id << std::endl;
+                // Don't exit, just continue with gRPC only
             }
         }
         
@@ -274,6 +452,10 @@ public:
         for (const auto& conn : connections) {
             initServerStub(conn);
         }
+        
+        // After parsing network configuration
+        total_node_count = network_nodes.size();
+        std::cout << "Network has " << total_node_count << " nodes" << std::endl;
     }
     
     ~GenericServer() {
@@ -298,13 +480,14 @@ public:
         
         CollisionData collision;
         int count = 0;
+        std::map<std::string, int> routing_stats;
         
         // Read streaming data from client
         while (reader->Read(&collision)) {
             count++;
             
             // Log progress
-            if (count % 1000 == 0) {
+            if (count % 100 == 0) {
                 std::cout << "Received " << count << " records" << std::endl;
             }
             
@@ -312,19 +495,49 @@ public:
             std::string target_server = chooseTargetServer(collision);
             
             if (!target_server.empty()) {
-                // Try to write to shared memory first
-                if (writeToSharedMemory(target_server, collision)) {
-                    std::cout << "Data written to shared memory for " << target_server << std::endl;
+                // Update routing statistics
+                routing_stats[target_server]++;
+                
+                // Check if target is on local machine for shared memory
+                bool is_local = (network_nodes[target_server].address == "127.0.0.1" || 
+                                network_nodes[target_server].address == "localhost");
+                
+                // Try to write to shared memory if local
+                if (is_local && shared_memories.find(target_server) != shared_memories.end() && 
+                    writeToSharedMemory(target_server, collision)) {
+                    // Successfully used shared memory
+                    if (count % 500 == 0) {  // Reduce log spam
+                        std::cout << "Data written to shared memory for " << target_server << std::endl;
+                    }
                 } else {
-                    // If shared memory fails, fall back to gRPC
+                    // Use gRPC
                     CollisionBatch batch;
                     *batch.add_collisions() = collision;
                     forwardDataToServer(target_server, batch);
+                    
+                    if (count % 500 == 0) {  // Reduce log spam
+                        std::cout << "Data sent via gRPC to " << target_server << std::endl;
+                    }
+                }
+            } else {
+                // No target server, store locally
+                // Add your local storage logic here
+                if (count % 100 == 0) {
+                    std::cout << "Data kept locally on entry point server" << std::endl;
                 }
             }
         }
         
+        // Print routing statistics
         std::cout << "Finished receiving " << count << " records" << std::endl;
+        std::cout << "Routing statistics:" << std::endl;
+        for (const auto& stat : routing_stats) {
+            std::cout << "  Sent to " << stat.first << ": " << stat.second << " records" << std::endl;
+        }
+        
+        // At the end of the method, after processing all records:
+        reportDistributionStats();
+        
         return Status::OK;
     }
     
@@ -338,10 +551,16 @@ public:
         for (int i = 0; i < batch->collisions_size(); i++) {
             const CollisionData& collision = batch->collisions(i);
             
-            // Process the data locally
-            // ...
+            // Check if we should keep this data locally
+            if (shouldKeepLocally(collision)) {
+                // Store the data locally
+                records_kept_locally++;
+                std::cout << "Keeping record locally based on content hash" << std::endl;
+                // Add your storage logic here
+                continue;
+            }
             
-            // Potentially forward to other servers based on your routing logic
+            // Otherwise, forward to next hop
             std::string target_server = chooseTargetServer(collision);
             
             if (!target_server.empty()) {
@@ -355,6 +574,13 @@ public:
                     forwardDataToServer(target_server, new_batch);
                 }
             }
+        }
+        
+        // Periodically report stats (e.g., every 10 batches)
+        static int batch_count = 0;
+        batch_count++;
+        if (batch_count % 10 == 0) {
+            reportDistributionStats();
         }
         
         return Status::OK;
