@@ -7,6 +7,8 @@
 #include <fstream>
 #include <sys/shm.h>  // For shared memory
 #include <nlohmann/json.hpp>  // JSON parsing library
+#include <thread>    // For std::this_thread
+#include <chrono>    // For std::chrono
 #include "proto/mini2.grpc.pb.h"
 #include "proto/mini2.pb.h"
 #include "parser/CSV.h"
@@ -137,7 +139,7 @@ private:
         }
     }
     
-    // Write data to shared memory for a specific connection
+    // Write data to shared memory for a specific connection with retry
     bool writeToSharedMemory(const std::string& connection_id, const CollisionData& data) {
         if (shared_memories.find(connection_id) == shared_memories.end()) {
             std::cerr << "Shared memory for " << connection_id << " not initialized" << std::endl;
@@ -147,31 +149,41 @@ private:
         SharedMemorySegment& shm = shared_memories[connection_id];
         SharedMemoryControl* control = static_cast<SharedMemoryControl*>(shm.memory);
         
-        // Check if there's space in the buffer
-        if (control->data_count >= (shm.size / sizeof(CollisionData))) {
-            std::cerr << "Shared memory buffer full for " << connection_id << std::endl;
-            return false;
+        // Try up to 5 times with increasing delays
+        for (int attempt = 0; attempt < 5; attempt++) {
+            // Check if there's space in the buffer
+            if (control->data_count < (shm.size / sizeof(CollisionData))) {
+                // Get pointer to data area (after control structure)
+                char* data_area = static_cast<char*>(shm.memory) + sizeof(SharedMemoryControl);
+                
+                // Serialize the data to the appropriate position
+                std::string serialized_data;
+                data.SerializeToString(&serialized_data);
+                
+                // Copy serialized data to shared memory
+                std::memcpy(data_area + control->write_index * sizeof(CollisionData), 
+                           serialized_data.data(), 
+                           std::min(serialized_data.size(), sizeof(CollisionData)));
+                
+                // Update control structure
+                control->write_index = (control->write_index + 1) % (shm.size / sizeof(CollisionData));
+                control->data_count++;
+                
+                return true;
+            }
+            
+            // Buffer is full, log only on first attempt to avoid spam
+            if (attempt == 0) {
+                std::cerr << "Shared memory buffer full for " << connection_id << ", retrying..." << std::endl;
+            }
+            
+            // Wait with exponential backoff before retrying (10ms, 20ms, 40ms, 80ms, 160ms)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10 * (1 << attempt)));
         }
         
-        // Get pointer to data area (after control structure)
-        char* data_area = static_cast<char*>(shm.memory) + sizeof(SharedMemoryControl);
-        
-        // Serialize the data to the appropriate position
-        std::string serialized_data;
-        data.SerializeToString(&serialized_data);
-        
-        // Copy serialized data to shared memory
-        // In a real implementation, you would need a more sophisticated buffer management
-        // This is a simplistic example
-        std::memcpy(data_area + control->write_index * sizeof(CollisionData), 
-                   serialized_data.data(), 
-                   std::min(serialized_data.size(), sizeof(CollisionData)));
-        
-        // Update control structure
-        control->write_index = (control->write_index + 1) % (shm.size / sizeof(CollisionData));
-        control->data_count++;
-        
-        return true;
+        std::cerr << "Shared memory buffer persistently full for " << connection_id << 
+                  ", falling back to gRPC" << std::endl;
+        return false;
     }
     
     // Read data from shared memory for a specific connection
@@ -244,11 +256,12 @@ private:
 
     // Improved routing logic based on the overlay network
     std::string chooseTargetServer(const CollisionData& data) {
-        total_records_seen++;
+        // Don't increment records_seen here, as this method may be called multiple times
+        // and we're now incrementing in the entry points directly
         
         // First check if this server should keep the data
         if (shouldKeepLocally(data)) {
-            records_kept_locally++;
+            // Don't increment records_kept_locally here either, as caller will do it
             return ""; // Empty string means keep locally
         }
         
@@ -271,17 +284,16 @@ private:
         // If target is directly connected to us, send directly
         for (const auto& conn : connections) {
             if (conn == target_node_id) {
-                records_forwarded[conn]++;
+                // Let the caller update the forwarding counts
                 return conn;
             }
         }
         
         // Otherwise, find the best next hop based on our overlay network
         // For simplicity in this implementation, just use the first connection
-        // In a more sophisticated implementation, you'd use graph algorithms to find the shortest path
         if (!connections.empty()) {
             std::string next_hop = connections[0];
-            records_forwarded[next_hop]++;
+            // Let the caller update the forwarding counts
             return next_hop;
         }
         
@@ -429,20 +441,25 @@ public:
         for (size_t i = 0; i < connections.size(); i++) {
             std::string conn_id = connections[i];
             
-            // Determine if the connection is on the same machine
-            bool is_local = (network_nodes[conn_id].address == "127.0.0.1" || 
-                            network_nodes[conn_id].address == "localhost");
+            // Determine if the connection is on the same machine by comparing IP addresses
+            // Two processes are on the same machine if they have the same IP address
+            bool is_local = (network_nodes[conn_id].address == network_nodes[server_id].address);
             
             // If not local, skip shared memory setup
             if (!is_local) {
-                std::cout << "Connection to " << conn_id << " is remote, using gRPC only." << std::endl;
+                std::cout << "Connection to " << conn_id << " is remote (" 
+                          << network_nodes[conn_id].address << " vs " 
+                          << network_nodes[server_id].address << "), using gRPC only." << std::endl;
                 continue;
             }
             
+            std::cout << "Connection to " << conn_id << " is local (same address: " 
+                      << network_nodes[conn_id].address << "), using shared memory." << std::endl;
+            
             // Use a different key for each connection
             int key = base_key + i;
-            // 1MB shared memory segment for each connection
-            if (!initSharedMemory(conn_id, key, 1024 * 1024)) {
+            // Increase from 1MB to 20MB shared memory segment for each connection
+            if (!initSharedMemory(conn_id, key, 20 * 1024 * 1024)) {
                 std::cerr << "Failed to initialize shared memory for " << conn_id << std::endl;
                 // Don't exit, just continue with gRPC only
             }
@@ -486,21 +503,36 @@ public:
         while (reader->Read(&collision)) {
             count++;
             
+            // Increment total records seen for ALL records at entry point
+            total_records_seen++;
+            
             // Log progress
             if (count % 100 == 0) {
                 std::cout << "Received " << count << " records" << std::endl;
             }
             
-            // Determine which server to route this data to
+            // Determine if this server should keep the data locally
+            bool keep_locally = shouldKeepLocally(collision);
+            
+            if (keep_locally) {
+                records_kept_locally++;
+                // No target server, store locally
+                if (count % 100 == 0) {
+                    std::cout << "Data kept locally on entry point server" << std::endl;
+                }
+                continue;
+            }
+            
+            // Otherwise, determine which server to route this data to
             std::string target_server = chooseTargetServer(collision);
             
             if (!target_server.empty()) {
                 // Update routing statistics
                 routing_stats[target_server]++;
+                records_forwarded[target_server]++;
                 
                 // Check if target is on local machine for shared memory
-                bool is_local = (network_nodes[target_server].address == "127.0.0.1" || 
-                                network_nodes[target_server].address == "localhost");
+                bool is_local = (network_nodes[target_server].address == network_nodes[server_id].address);
                 
                 // Try to write to shared memory if local
                 if (is_local && shared_memories.find(target_server) != shared_memories.end() && 
@@ -520,10 +552,10 @@ public:
                     }
                 }
             } else {
-                // No target server, store locally
-                // Add your local storage logic here
+                // No available connection but we should have forwarded - rare case
+                records_kept_locally++;
                 if (count % 100 == 0) {
-                    std::cout << "Data kept locally on entry point server" << std::endl;
+                    std::cout << "No route available, keeping locally" << std::endl;
                 }
             }
         }
@@ -545,10 +577,14 @@ public:
     Status ForwardData(ServerContext* context,
                       const CollisionBatch* batch,
                       Empty* response) override {
-        std::cout << "Received forwarded batch with " << batch->collisions_size() << " records" << std::endl;
+        int batch_size = batch->collisions_size();
+        std::cout << "Received forwarded batch with " << batch_size << " records" << std::endl;
+        
+        // Increment the total records counter for ALL received records
+        total_records_seen += batch_size;
         
         // Process each collision in the batch
-        for (int i = 0; i < batch->collisions_size(); i++) {
+        for (int i = 0; i < batch_size; i++) {
             const CollisionData& collision = batch->collisions(i);
             
             // Check if we should keep this data locally
@@ -564,6 +600,9 @@ public:
             std::string target_server = chooseTargetServer(collision);
             
             if (!target_server.empty()) {
+                // Increment the forwarding counter directly here
+                records_forwarded[target_server]++;
+                
                 // Try to write to shared memory first
                 if (writeToSharedMemory(target_server, collision)) {
                     std::cout << "Data written to shared memory for " << target_server << std::endl;

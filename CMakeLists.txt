@@ -83,6 +83,7 @@ add_custom_target(generate_proto_files
 set(SERVER_SRC
     cpp/src/server.cpp
     cpp/src/parser/CSV.cpp
+    cpp/src/SpatialAnalysis.cpp
     ${mini2_proto_srcs}
     ${mini2_grpc_srcs}
 )

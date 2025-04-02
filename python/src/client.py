@@ -47,33 +47,21 @@ class CollisionDataClient:
         try:
             with open(csv_file_path, 'r') as file:
                 csv_reader = csv.DictReader(file)
-                batch = []
                 total_records = 0
                 
-                for row in csv_reader:
-                    collision = self.parse_collision_data(row)
-                    if collision:
-                        batch.append(collision)
-                        
-                        if len(batch) >= batch_size:
-                            # Stream the batch
-                            batch_msg = mini2_pb2.CollisionBatch(collisions=batch)
-                            try:
-                                self.stub.ForwardData(batch_msg)
-                                total_records += len(batch)
+                # Define a generator function to create the request iterator
+                def generate_requests():
+                    nonlocal total_records
+                    for row in csv_reader:
+                        collision = self.parse_collision_data(row)
+                        if collision:
+                            yield collision
+                            total_records += 1
+                            if total_records % batch_size == 0:
                                 print(f"Sent {total_records} records...")
-                            except grpc.RpcError as e:
-                                print(f"Error sending batch: {e}")
-                            batch = []
                 
-                # Send remaining records
-                if batch:
-                    batch_msg = mini2_pb2.CollisionBatch(collisions=batch)
-                    try:
-                        self.stub.ForwardData(batch_msg)
-                        total_records += len(batch)
-                    except grpc.RpcError as e:
-                        print(f"Error sending final batch: {e}")
+                # Call the streaming RPC with the request iterator
+                response = self.stub.StreamCollisions(generate_requests())
                 
                 print(f"Total records processed: {total_records}")
 
@@ -89,12 +77,13 @@ def main():
     client = CollisionDataClient()
     
     # Path to your CSV file
-    csv_file_path = "Motor_Vehicle_Collisions_-_Crashes_20250223.csv"
+    csv_file_path = "Motor_Vehicle_Collisions_-_Crashes_20250402.csv"
     
     print("Starting to stream collision data to Server A...")
     start_time = time.time()
     
-    client.stream_data(csv_file_path)
+    # Use a smaller batch size to reduce pressure on the system
+    client.stream_data(csv_file_path, batch_size=10)
     
     end_time = time.time()
     print(f"Data streaming completed in {end_time - start_time:.2f} seconds")
