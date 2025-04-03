@@ -50,7 +50,7 @@ class CollisionDataClient:
                 total_records = 0
                 
                 # Define a generator function to create the request iterator
-                def generate_requests():
+                def generate_data():
                     nonlocal total_records
                     for row in csv_reader:
                         collision = self.parse_collision_data(row)
@@ -61,7 +61,7 @@ class CollisionDataClient:
                                 print(f"Sent {total_records} records...")
                 
                 # Call the streaming RPC with the request iterator
-                response = self.stub.StreamCollisions(generate_requests())
+                response = self.stub.StreamCollisions(generate_data())
                 
                 print(f"Total records processed: {total_records}")
 
@@ -71,6 +71,32 @@ class CollisionDataClient:
             print(f"An unexpected error occurred: {e}")
         finally:
             self.channel.close()
+
+    def run_client(self, dataset_path):
+        # Load the dataset
+        dataset = self.load_dataset(dataset_path)  # Your dataset loading function
+        dataset_size = len(dataset)
+        
+        # First, send dataset size information
+        print(f"Sending dataset size: {dataset_size} records")
+        info = mini2_pb2.DatasetInfo(total_size=dataset_size)
+        self.stub.SetDatasetInfo(info)
+        
+        # Now stream the collision data
+        print("Starting to stream collision data...")
+        response = self.stub.StreamCollisions(self.generate_collision_data(dataset))
+        print("Finished streaming data")
+
+    def generate_collision_data(self, dataset):
+        # Generate data records from your dataset
+        for record in dataset:
+            collision = mini2_pb2.CollisionData(
+                crash_date=record['crash_date'],
+                crash_time=record['crash_time'],
+                borough=record['borough'],
+                # ...other fields...
+            )
+            yield collision
 
 def main():
     # Create client instance

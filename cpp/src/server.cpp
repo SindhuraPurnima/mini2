@@ -27,6 +27,7 @@ using mini2::RiskAssessment;
 using mini2::Empty;
 using mini2::EntryPointService;
 using mini2::InterServerService;
+using mini2::DatasetInfo;
 
 // Structure to hold shared memory information
 struct SharedMemorySegment {
@@ -51,6 +52,15 @@ struct SharedMemoryControl {
     int data_count;
     // Additional control fields can be added here
 };
+
+// Add these new static tracking variables at the top of the file (global scope)
+static int64_t g_total_client_records_sent = 0;  // Total records sent by clients to A
+static int64_t g_expected_total_dataset_size = 0;  // Expected final dataset size
+
+// Add a function to set the expected dataset size (could be called via command line)
+void setExpectedDatasetSize(int64_t size) {
+    g_expected_total_dataset_size = size;
+}
 
 // Generic Server implementation
 class GenericServer : public EntryPointService::Service, public InterServerService::Service {
@@ -84,6 +94,9 @@ private:
     // Add SpatialAnalysis instance and local data storage
     SpatialAnalysis spatialAnalysis;
     std::vector<CSVRow> localCollisionData;
+    
+    // Add to GenericServer class to store dataset size
+    int64_t total_dataset_size = 0;
     
     // Initialize shared memory for a specific connection
     bool initSharedMemory(const std::string& connection_id, int key, size_t size) {
@@ -305,29 +318,80 @@ private:
         return ""; // If no connections, we have to keep it locally
     }
     
-    // Add method to report data distribution statistics
-    void reportDistributionStats() {
-        std::cout << "\n--- DATA DISTRIBUTION STATISTICS ---\n";
-        std::cout << "Total records seen: " << total_records_seen << std::endl;
+    // Update the reporting method
+    void reportEnhancedDistributionStats() {
+        // Use global value if class variable isn't set but global is
+        if (total_dataset_size == 0 && g_expected_total_dataset_size > 0) {
+            total_dataset_size = g_expected_total_dataset_size;
+        }
+        
+        std::cout << "\n--- ENHANCED DATA DISTRIBUTION STATISTICS ---\n";
+        std::cout << "Server: " << server_id << std::endl;
+        std::cout << "Total records seen by this server: " << total_records_seen << std::endl;
         
         if (total_records_seen > 0) {
             double keep_percentage = (records_kept_locally * 100.0) / total_records_seen;
             std::cout << "Records kept locally: " << records_kept_locally 
-                      << " (" << keep_percentage << "%)" << std::endl;
+                      << " (" << keep_percentage << "% of records seen by this server)" << std::endl;
             
+            // Show percentage of total dataset for ALL servers
+            if (total_dataset_size > 0) {
+                double global_percentage = (records_kept_locally * 100.0) / total_dataset_size;
+                std::cout << "Records kept locally as % of total dataset: " 
+                          << global_percentage << "%" << std::endl;
+                
+                // Expected ideal value is 100% / total_node_count
+                double ideal_percentage = 100.0 / total_node_count;
+                std::cout << "Ideal distribution: " << ideal_percentage << "% per node" << std::endl;
+                
+                // Show variance from ideal
+                double variance = global_percentage - ideal_percentage;
+                std::cout << "Variance from ideal: " << variance << "% (" 
+                          << (variance > 0 ? "over-allocated" : "under-allocated") << ")" << std::endl;
+            }
+            
+            // For entry point, show global processing progress
+            if (is_entry_point) {
+                double progress = (total_records_seen * 100.0) / total_dataset_size;
+                std::cout << "Processing progress: " << progress << "% complete" << std::endl;
+            }
+            
+            // Regular forwarding stats
             std::cout << "Records forwarded:" << std::endl;
             for (const auto& stat : records_forwarded) {
                 double forward_percentage = (stat.second * 100.0) / total_records_seen;
                 std::cout << "  To " << stat.first << ": " << stat.second 
                           << " (" << forward_percentage << "%)" << std::endl;
             }
-            
-            // Ideal distribution would be each node handling 1/N of the data
-            double ideal_percentage = 100.0 / total_node_count;
-            std::cout << "Ideal distribution: " << ideal_percentage << "% per node" << std::endl;
         }
         
-        std::cout << "--- END STATISTICS ---\n\n";
+        std::cout << "--- END ENHANCED STATISTICS ---\n\n";
+    }
+
+    // Helper method to estimate total records across all servers (this is approximate)
+    int64_t estimateTotalRecordsAllServers() {
+        // If we're the entry point, we've seen everything that entered the system
+        if (is_entry_point) {
+            return total_records_seen;
+        } else {
+            // For non-entry point, try to guess based on hash distribution
+            // This is inherently imprecise without global coordination
+            if (records_kept_locally > 0) {
+                // Assuming ideal distribution, extrapolate from our local data
+                return records_kept_locally * total_node_count;
+            } else {
+                return 0;  // Can't estimate if we have no data
+            }
+        }
+    }
+
+    // Helper method to estimate this server's share of global data
+    double estimateGlobalPercentage() {
+        int64_t estimated_total = estimateTotalRecordsAllServers();
+        if (estimated_total > 0) {
+            return (records_kept_locally * 100.0) / estimated_total;
+        }
+        return 0.0;
     }
 
     // Add a method to analyze network topology
@@ -445,9 +509,15 @@ private:
 public:
     GenericServer(const std::string& config_path) 
         : is_entry_point(false),
-          // Initialize SpatialAnalysis with thresholds for injuries and deaths
           spatialAnalysis(10, 2)  // 10 injuries or 2 deaths to mark area high-risk
     {
+        // Use the global value if it's been set via command line
+        if (g_expected_total_dataset_size > 0) {
+            total_dataset_size = g_expected_total_dataset_size;
+            std::cout << "Using dataset size from command line: " 
+                      << total_dataset_size << " records" << std::endl;
+        }
+        
         // Load configuration from JSON file
         std::ifstream config_file(config_path);
         if (!config_file.is_open()) {
@@ -556,9 +626,13 @@ public:
         int count = 0;
         std::map<std::string, int> routing_stats;
         
+        // Add at the beginning:
+        static int entry_count = 0;
+        
         // Read streaming data from client
         while (reader->Read(&collision)) {
             count++;
+            entry_count++;  // Count all entries ever received
             
             // Increment total records seen for ALL records at entry point
             total_records_seen++;
@@ -619,6 +693,13 @@ public:
                     std::cout << "No route available, keeping locally" << std::endl;
                 }
             }
+            
+            // Add periodic reporting similar to what other servers use
+            if (entry_count % 1000 == 0) {  // Every 1000 records (adjust as needed)
+                std::cout << "\n--- PERIODIC DATA DISTRIBUTION REPORT (ENTRY POINT) ---\n";
+                reportEnhancedDistributionStats();
+                std::cout << "--- END PERIODIC REPORT ---\n\n";
+            }
         }
         
         // Print routing statistics
@@ -629,7 +710,7 @@ public:
         }
         
         // Report distribution stats and perform analysis after processing all records
-        reportDistributionStats();
+        reportEnhancedDistributionStats();
         processLocalData();
         
         return Status::OK;
@@ -688,7 +769,7 @@ public:
         static int batch_count = 0;
         batch_count++;
         if (batch_count % 10 == 0) {
-            reportDistributionStats();
+            reportEnhancedDistributionStats();
             
             // Perform spatial analysis periodically if we have enough data
             if (localCollisionData.size() >= 100) {
@@ -721,16 +802,104 @@ public:
     bool isEntryPoint() const {
         return is_entry_point;
     }
+
+    // Add a new RPC implementation
+    Status SetDatasetInfo(ServerContext* context,
+                         const DatasetInfo* info,
+                         Empty* response) override {
+        total_dataset_size = info->total_size();
+        std::cout << "Received dataset size information: " << total_dataset_size << " records" << std::endl;
+        
+        // Forward this information to all connected servers
+        broadcastDatasetSize();
+        
+        return Status::OK;
+    }
+    
+private:
+    // Add a method to forward dataset size to all connected servers
+    void broadcastDatasetSize() {
+        // Only entry point should broadcast the total size
+        if (!is_entry_point) return;
+        
+        // Create RPC message
+        DatasetInfo info;
+        info.set_total_size(total_dataset_size);
+        
+        // Send to each connected server
+        for (const std::string& server_id : connections) {
+            if (server_stubs.find(server_id) == server_stubs.end()) {
+                initServerStub(server_id);
+            }
+            
+            ClientContext context;
+            Empty response;
+            
+            // We need to add this RPC to the InterServerService too
+            Status status = server_stubs[server_id]->SetTotalDatasetSize(&context, info, &response);
+            
+            if (status.ok()) {
+                std::cout << "Forwarded dataset size to server " << server_id << std::endl;
+            } else {
+                std::cerr << "Failed to forward dataset size to " << server_id << std::endl;
+            }
+        }
+    }
+
+    // Add a new RPC implementation
+    Status SetTotalDatasetSize(ServerContext* context,
+                              const DatasetInfo* info,
+                              Empty* response) override {
+        total_dataset_size = info->total_size();
+        std::cout << "Received total dataset size from another server: " 
+                  << total_dataset_size << " records" << std::endl;
+        
+        // Forward to our connections (creates a broadcast tree)
+        for (const std::string& server_id : connections) {
+            // Skip the one we received from (to avoid loops)
+            std::string peer = context->peer();
+            if (peer.find(network_nodes[server_id].address) != std::string::npos) {
+                continue;
+            }
+            
+            if (server_stubs.find(server_id) == server_stubs.end()) {
+                initServerStub(server_id);
+            }
+            
+            ClientContext new_context;
+            Empty new_response;
+            Status status = server_stubs[server_id]->SetTotalDatasetSize(&new_context, *info, &new_response);
+            
+            if (status.ok()) {
+                std::cout << "Forwarded dataset size to server " << server_id << std::endl;
+            } else {
+                std::cerr << "Failed to forward dataset size to " << server_id << std::endl;
+            }
+        }
+        
+        return Status::OK;
+    }
 };
 
 int main(int argc, char** argv) {
     // Check for config file path
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <config_file.json>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <config_file.json> [expected_dataset_size]" << std::endl;
         return 1;
     }
     
     std::string config_path = argv[1];
+    
+    // Check for optional expected dataset size
+    if (argc >= 3) {
+        try {
+            int64_t expected_size = std::stoll(argv[2]);
+            g_expected_total_dataset_size = expected_size;
+            std::cout << "Expected total dataset size: " << g_expected_total_dataset_size << " records" << std::endl;
+        } catch (...) {
+            std::cerr << "Invalid expected dataset size, ignoring" << std::endl;
+        }
+    }
     
     // Create and configure the server
     GenericServer server(config_path);
