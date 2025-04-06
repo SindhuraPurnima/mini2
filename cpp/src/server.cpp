@@ -60,13 +60,13 @@ struct SharedMemoryBuffer
 };
 
 // Booleans for testing failure of shared memory and grpc
-static bool g_simulate_shm_failure = false;
+static bool g_simulate_shm_failure = true;
 static bool g_simulate_grpc_failure = false;
 
-class SysVSharedMemoryManager
+class SharedMemoryManager
 {
 public:
-    SysVSharedMemoryManager(key_t key, bool create) : created_(create)
+    SharedMemoryManager(key_t key, bool create) : created_(create)
     {
         int flags = 0666;
         if (create)
@@ -93,7 +93,7 @@ public:
         }
     }
 
-    ~SysVSharedMemoryManager()
+    ~SharedMemoryManager()
     {
         shmdt(buffer_);
         // Only remove the segment if this instance created it.
@@ -164,7 +164,7 @@ void setExpectedDatasetSize(int64_t size)
 }
 
 // ---------------------------------------------------------------------------
-// Structures for Network Configuration
+// Structure for Network Configuration
 // ---------------------------------------------------------------------------
 struct ProcessNode
 {
@@ -175,7 +175,7 @@ struct ProcessNode
 };
 
 // ---------------------------------------------------------------------------
-// GenericServer Implementation (without processing)
+// GenericServer Capable of Running Any Server Given Config File
 // ---------------------------------------------------------------------------
 class GenericServer : public EntryPointService::Service, public InterServerService::Service
 {
@@ -189,9 +189,9 @@ private:
     std::map<std::string, ProcessNode> network_nodes;
     std::vector<std::string> connections;
 
-    // For each local connection, store a unique SysVSharedMemoryManager.
-    std::map<std::string, std::unique_ptr<SysVSharedMemoryManager>> outgoingShmManagers;
-    std::map<std::string, std::unique_ptr<SysVSharedMemoryManager>> incomingShmManagers;
+    // For each local connection, store a unique SharedMemoryManager.
+    std::map<std::string, std::unique_ptr<SharedMemoryManager>> outgoingShmManagers;
+    std::map<std::string, std::unique_ptr<SharedMemoryManager>> incomingShmManagers;
     std::atomic<bool> running_{true};
     std::vector<std::thread> readerThreads;
 
@@ -296,6 +296,12 @@ private:
     // Decide whether to keep data locally based on a consistent hash.
     bool shouldKeepLocally(size_t hash_value)
     {
+        // If this node has no children, always process locally.
+        if (connections.empty())
+        {
+            return true;
+        }
+
         total_node_count = network_nodes.size();
         int target_node_index = hash_value % total_node_count;
         std::vector<std::string> ordered_nodes;
@@ -318,10 +324,6 @@ private:
     // Choose target server for routing.
     std::string chooseTargetServer(size_t hash_value)
     {
-        if (shouldKeepLocally(hash_value))
-        {
-            return ""; // Keep locally.
-        }
         std::vector<std::string> ordered_nodes;
         for (const auto &node_pair : network_nodes)
         {
@@ -365,7 +367,7 @@ private:
             try
             {
                 // Create outgoing shared memory segment.
-                outgoingShmManagers[child_id] = std::make_unique<SysVSharedMemoryManager>(shm_key, true);
+                outgoingShmManagers[child_id] = std::make_unique<SharedMemoryManager>(shm_key, true);
                 std::cout << "Created outgoing shared memory for child " << child_id << " with key " << shm_key << std::endl;
             }
             catch (...)
@@ -375,7 +377,9 @@ private:
         }
     }
 
-    // Attaches readers to child nodes and handles incoming data
+    // Attaches readers to child nodes and handles incoming data from shared memory
+    // Also handles forwarding of data to child nodes if they exist via GRPC or shared memory
+    // Number of reader threads in the system is equal to the number of parent nodes
     void readParentData()
     {
         // Identify our parent(s): any node whose connections list contains our server_id.
@@ -394,11 +398,11 @@ private:
             int key = base_shm_key + std::hash<std::string>{}(parent_id + "_" + server_id) % 1000;
             try
             {
-                // Attach to parent's shared memory segment (as reader).
-                incomingShmManagers[parent_id] = std::make_unique<SysVSharedMemoryManager>(key, false);
+                // Attaches parent shared memory segment (as reader).
+                incomingShmManagers[parent_id] = std::make_unique<SharedMemoryManager>(key, false);
                 std::cout << "Child " << server_id << " attached to parent's (" << parent_id
                           << ") shared memory (key " << key << ")" << std::endl;
-                // Spawn a reader thread to drain data from this parent's outgoing channel.
+                // Spawns a reader thread to drain data from this parent's outgoing channel.
                 readerThreads.emplace_back([this, parent_id]()
                                            {
                 int drainCount = 0;
@@ -432,6 +436,8 @@ private:
                                         // Increment forwarded counter.
                                         std::lock_guard<std::mutex> lock(metricsMutex);
                                         records_forwarded[target_server]++;
+
+                                        // Commented out to reduce terminal bloat
                                         // std::cout << "Node " << server_id << " forwarded data to "
                                         //           << target_server << " via outgoing shared memory." << std::endl;
                                     }
@@ -443,7 +449,7 @@ private:
                                 }
                                 else
                                 {
-                                    // Fallback (e.g., via gRPC).
+                                    // Fallback (via gRPC).
                                     if (!g_simulate_grpc_failure)
                                     {
                                         CollisionBatch batch;
@@ -464,13 +470,13 @@ private:
                             }
                             else
                             {
-                                // keep data locally
+                                // Keep data locally
                                 records_kept_locally.fetch_add(1, std::memory_order_relaxed);
                             }
                             // Once every 1000 messages, print the distribution report.
-                            if (drainCount % 1000 == 0)
+                            if (drainCount % 10000 == 0)
                             {
-                                reportEnhancedDistributionStats();
+                                reportDistributionStats();
                             }
                         }
                     }
@@ -486,8 +492,8 @@ private:
         }
     }
 
-    // Report distribution statistics with additional metrics.
-    void reportEnhancedDistributionStats()
+    // Report distribution statistics.
+    void reportDistributionStats()
     {
         if (total_dataset_size == 0 && g_expected_total_dataset_size > 0)
         {
@@ -509,7 +515,7 @@ private:
         std::cout << "--- END REPORT ---\n\n";
     }
 
-    // Analyze network topology.
+    // Prints network topology.
     void analyzeNetworkTopology()
     {
         std::cout << "\n--- Network Topology for Server " << server_id << " ---\n";
@@ -570,7 +576,7 @@ private:
     }
 
 public:
-    // Constructor uses entry_point_flag in the initializer list.
+    // Constructor uses entry_point_flag sourced from the config_X.jsons
     GenericServer(const std::string &config_path)
         : entry_point_flag(false)
     {
@@ -724,7 +730,7 @@ public:
             if (entry_count % 1000 == 0)
             {
                 std::cout << "\n--- PERIODIC DATA DISTRIBUTION REPORT ---\n";
-                reportEnhancedDistributionStats();
+                reportDistributionStats();
                 std::cout << "--- END REPORT ---\n\n";
             }
         }
@@ -734,7 +740,7 @@ public:
         {
             std::cout << "  Sent to " << stat.first << ": " << stat.second << " records" << std::endl;
         }
-        reportEnhancedDistributionStats();
+        reportDistributionStats();
         return Status::OK;
     }
 
@@ -781,7 +787,7 @@ public:
                 }
             }
         }
-        reportEnhancedDistributionStats();
+        reportDistributionStats();
         return Status::OK;
     }
 
@@ -805,79 +811,6 @@ public:
     bool isEntryPoint() const
     {
         return entry_point_flag;
-    }
-
-    // RPC to set dataset info.
-    Status SetDatasetInfo(ServerContext *context,
-                          const DatasetInfo *info,
-                          Empty *response) override
-    {
-        total_dataset_size = info->total_size();
-        std::cout << "Received dataset size information: " << total_dataset_size << " records" << std::endl;
-        broadcastDatasetSize();
-        return Status::OK;
-    }
-
-private:
-    // Forward dataset size to all connected servers.
-    void broadcastDatasetSize()
-    {
-        if (!entry_point_flag)
-            return;
-        DatasetInfo info;
-        info.set_total_size(total_dataset_size);
-        for (const std::string &srv_id : connections)
-        {
-            if (server_stubs.find(srv_id) == server_stubs.end())
-            {
-                initServerStub(srv_id);
-            }
-            ClientContext context;
-            Empty response;
-            Status status = server_stubs[srv_id]->SetTotalDatasetSize(&context, info, &response);
-            if (status.ok())
-            {
-                std::cout << "Forwarded dataset size to server " << srv_id << std::endl;
-            }
-            else
-            {
-                std::cerr << "Failed to forward dataset size to " << srv_id << std::endl;
-            }
-        }
-    }
-
-    // RPC to set total dataset size.
-    Status SetTotalDatasetSize(ServerContext *context,
-                               const DatasetInfo *info,
-                               Empty *response) override
-    {
-        total_dataset_size = info->total_size();
-        std::cout << "Received total dataset size from another server: "
-                  << total_dataset_size << " records" << std::endl;
-        for (const std::string &srv_id : connections)
-        {
-            std::string peer = context->peer();
-            if (peer.find(network_nodes[srv_id].address) != std::string::npos)
-            {
-                continue;
-            }
-            if (server_stubs.find(srv_id) == server_stubs.end())
-            {
-                initServerStub(srv_id);
-            }
-            ClientContext new_context;
-            Empty new_response;
-            Status status = server_stubs[srv_id]->SetTotalDatasetSize(&new_context, *info, &new_response);
-            if (status.ok())
-            {
-                std::cout << "Forwarded dataset size to server " << srv_id << std::endl;
-            }
-            else
-            {
-                std::cerr << "Failed to forward dataset size to " << srv_id << std::endl;
-            }
-        }
-        return Status::OK;
     }
 };
 

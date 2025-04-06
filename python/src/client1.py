@@ -104,7 +104,7 @@ def main():
     client = CollisionDataClient()
 
     # Path to your CSV file
-    csv_file_path = "collisions.csv"
+    csv_file_path = "collisions2.csv"
 
     print("Starting to stream collision data to Server A...")
     start_time = time.time()
