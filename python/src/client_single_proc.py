@@ -37,7 +37,9 @@ class CollisionDataClient:
             print(f"Error parsing row: {e}")
             return None
 
-    def stream_data(self, csv_file_path, start_line, end_line, batch_size=100):
+    def stream_data(
+        self, csv_file_path, start_line, end_line, batch_size=100, final_segment=False
+    ):
         """Stream data from a specific portion of the CSV file to Server A"""
         try:
             with open(csv_file_path, "r") as file:
@@ -68,19 +70,24 @@ class CollisionDataClient:
                 print(
                     f"Client starting at line {start_line}: Total records processed: {total_records}"
                 )
-            try:
-                time.sleep(10)
-                self.stub.SignalCompletion(mini2_pb2.Empty())
-                print(f"Client starting at line {start_line}: Sent completion signal")
-            except grpc.RpcError as e:
-                print(f"Error sending completion signal: {e}")
+            if final_segment:
+                try:
+                    time.sleep(10)
+                    # three here to trigger the analysis code
+                    self.stub.SignalCompletion(mini2_pb2.Empty())
+                    self.stub.SignalCompletion(mini2_pb2.Empty())
+                    self.stub.SignalCompletion(mini2_pb2.Empty())
+                    print(
+                        f"Client starting at line {start_line}: Sent completion signal"
+                    )
+                except grpc.RpcError as e:
+                    print(f"Error sending completion signal: {e}")
 
         except FileNotFoundError:
             print(f"Error: Could not find CSV file at {csv_file_path}")
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
-        finally:
-            self.channel.close()
+
 
 
 def count_data_rows(csv_file_path):
@@ -95,34 +102,30 @@ def client_process(csv_file_path, start_line, end_line, batch_size):
 
 
 def main():
-    csv_file_path = "collisions.csv"  # Path to your CSV file
+    csv_file_path = "collisions.csv"
     total_rows = count_data_rows(csv_file_path)
     print(f"Total data rows in CSV: {total_rows}")
 
-    # Partition the CSV into 3 segments
     segment_size = total_rows // 3
     segments = []
     for i in range(3):
         start = i * segment_size
-        # For the last segment, include any remaining rows.
         end = (i + 1) * segment_size if i < 2 else total_rows
         segments.append((start, end))
         print(f"Segment {i + 1}: Lines {start} to {end}")
 
-    batch_size = 100  # Adjust as needed
-
+    batch_size = 100
     start_time = time.time()
 
-    # Spawn three client processes
-    processes = []
-    for start, end in segments:
-        p = Process(target=client_process, args=(csv_file_path, start, end, batch_size))
-        processes.append(p)
-        p.start()
+    client = CollisionDataClient()
+    for i, (start, end) in enumerate(segments):
+        final_segment = i == len(segments) - 1
+        client.stream_data(
+            csv_file_path, start, end, batch_size, final_segment=final_segment
+        )
 
-    # Wait for all processes to complete
-    for p in processes:
-        p.join()
+    # Close the channel after all segments are processed
+    client.channel.close()
 
     end_time = time.time()
     print(f"Data streaming completed in {end_time - start_time:.2f} seconds")

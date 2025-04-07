@@ -3,13 +3,10 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <unordered_map>
 #include <fstream>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/types.h>
-#include <thread>
-#include <chrono>
 #include <atomic>
 #include <mutex>
 #include <iostream>
@@ -17,10 +14,13 @@
 #include <cstdlib>
 #include <nlohmann/json.hpp>
 #include <csignal>
+#include <chrono>
+#include <thread>
+#include <functional>
 
 #include "proto/mini2.grpc.pb.h"
 #include "proto/mini2.pb.h"
-#include "parser/CSV.h"
+#include "../include/parser/SpatialAnalysis.h"
 
 using json = nlohmann::json;
 using grpc::Channel;
@@ -29,13 +29,10 @@ using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::Status;
-using mini2::CollisionBatch;
 using mini2::CollisionData;
-using mini2::DatasetInfo;
 using mini2::Empty;
 using mini2::EntryPointService;
 using mini2::InterServerService;
-using mini2::RiskAssessment;
 
 constexpr int MAX_MESSAGE_SIZE = 1024; // Maximum size (in bytes) per message.
 constexpr int NUM_SLOTS = 100;         // Number of fixed slots in the buffer.
@@ -59,8 +56,10 @@ struct SharedMemoryBuffer
     SharedMemorySlot slots[NUM_SLOTS];
 };
 
+std::vector<mini2::CollisionData> collision_refs;
+
 // Booleans for testing failure of shared memory and grpc
-static bool g_simulate_shm_failure = true;
+static bool g_simulate_shm_failure = false;
 static bool g_simulate_grpc_failure = false;
 
 class SharedMemoryManager
@@ -116,18 +115,31 @@ public:
             std::cerr << "Message too large." << std::endl;
             return false;
         }
-        int write = buffer_->header.write_index;
-        int read = buffer_->header.read_index;
-        if (((write + 1) % buffer_->header.capacity) == read)
+        // Try multiple times if buffer is full
+        const int MAX_ATTEMPTS = 5;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++)
         {
-            std::cerr << "Shared memory buffer full." << std::endl;
-            return false;
+            int write = buffer_->header.write_index;
+            int read = buffer_->header.read_index;
+
+            if (((write + 1) % buffer_->header.capacity) == read)
+            {
+                // Buffer is full, wait a bit before retrying
+                if (attempt < MAX_ATTEMPTS - 1)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
+                std::cerr << "Shared memory buffer full after " << MAX_ATTEMPTS << " attempts." << std::endl;
+                return false;
+            }
+            SharedMemorySlot &slot = buffer_->slots[write];
+            slot.msg_len = msg.size();
+            std::memcpy(slot.data, msg.data(), msg.size());
+            buffer_->header.write_index = (write + 1) % buffer_->header.capacity;
+            return true;
         }
-        SharedMemorySlot &slot = buffer_->slots[write];
-        slot.msg_len = msg.size();
-        std::memcpy(slot.data, msg.data(), msg.size());
-        buffer_->header.write_index = (write + 1) % buffer_->header.capacity;
-        return true;
+        return false;
     }
 
     // Read a message from the circular buffer.
@@ -164,7 +176,7 @@ void setExpectedDatasetSize(int64_t size)
 }
 
 // ---------------------------------------------------------------------------
-// Structure for Network Configuration
+// Structures for Network Configuration
 // ---------------------------------------------------------------------------
 struct ProcessNode
 {
@@ -175,11 +187,12 @@ struct ProcessNode
 };
 
 // ---------------------------------------------------------------------------
-// GenericServer Capable of Running Any Server Given Config File
+// GenericServer Implementation
 // ---------------------------------------------------------------------------
 class GenericServer : public EntryPointService::Service, public InterServerService::Service
 {
 private:
+    std::mutex stub_mutex_;
     // Server configuration.
     std::string server_id;
     std::string server_address;
@@ -196,7 +209,7 @@ private:
     std::vector<std::thread> readerThreads;
 
     // gRPC stubs for connections to other servers.
-    std::map<std::string, std::unique_ptr<InterServerService::Stub>> server_stubs;
+    std::map<std::string, std::shared_ptr<InterServerService::Stub>> server_stubs;
 
     // Data distribution counters.
     std::atomic<int> total_records_seen{0};
@@ -216,6 +229,10 @@ private:
     // Flag indicating if this server is the entry point.
     bool entry_point_flag;
 
+    // For completion so multiple parents don't hit a server
+    std::mutex completionMutex;
+    bool completionPropagated = false;
+
     // Write a message (serialized CollisionData) to shared memory.
     bool writeToSharedMemory(const std::string &connection_id, const CollisionData &data)
     {
@@ -229,7 +246,7 @@ private:
         return outgoingShmManagers[connection_id]->writeMessage(serialized_data);
     }
 
-    // Read a message from shared memory and deserialize into CollisionData.
+    // Read a message from shared memory and deserialize into CollisionData. Flag for removal
     bool readFromSharedMemory(const std::string &connection_id, CollisionData &data)
     {
         if (incomingShmManagers.find(connection_id) == incomingShmManagers.end())
@@ -246,20 +263,16 @@ private:
     }
 
     // Initialize a gRPC channel (stub) to another server.
-    void initServerStub(const std::string &srv_id)
+    void initServerStub(const std::string &server_id)
     {
-        if (network_nodes.find(srv_id) != network_nodes.end())
-        {
-            std::string target_address = network_nodes[srv_id].address + ":" +
-                                         std::to_string(network_nodes[srv_id].port);
-            auto channel = grpc::CreateChannel(target_address, grpc::InsecureChannelCredentials());
-            server_stubs[srv_id] = InterServerService::NewStub(channel);
-            std::cout << "Created channel to server " << srv_id << " at " << target_address << std::endl;
-        }
+        std::string server_address = network_nodes[server_id].address + ":" +
+                                     std::to_string(network_nodes[server_id].port);
+        auto channel = grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+        server_stubs[server_id] = InterServerService::NewStub(channel);
     }
 
     // Forward data to a connected server via gRPC.
-    void forwardDataToServer(const std::string &srv_id, const CollisionBatch &batch)
+    void forwardDataToServer(const std::string &srv_id, const CollisionData &collision)
     {
         // Ensure the stub for the target server exists.
         if (server_stubs.find(srv_id) == server_stubs.end() || !server_stubs[srv_id])
@@ -272,9 +285,10 @@ private:
                 return;
             }
         }
+        // std::cout << "Received data from another server" << srv_id<<std::endl;
         ClientContext context;
         Empty response;
-        Status status = server_stubs[srv_id]->ForwardData(&context, batch, &response);
+        Status status = server_stubs[srv_id]->ForwardData(&context, collision, &response);
         if (!status.ok())
         {
             std::cerr << "Failed to forward data to " << srv_id << ": " << status.error_message() << std::endl;
@@ -283,8 +297,8 @@ private:
 
     size_t getHash(const CollisionData &data)
     {
-        std::string key = data.borough() + data.zip_code() +
-                          data.on_street_name() + data.cross_street_name();
+        std::string key = data.borough() + data.crash_date() +
+                          data.crash_time();
         size_t hash_value = std::hash<std::string>{}(key);
         static std::random_device rd;
         static std::mt19937 gen(rd());
@@ -296,12 +310,6 @@ private:
     // Decide whether to keep data locally based on a consistent hash.
     bool shouldKeepLocally(size_t hash_value)
     {
-        // If this node has no children, always process locally.
-        if (connections.empty())
-        {
-            return true;
-        }
-
         total_node_count = network_nodes.size();
         int target_node_index = hash_value % total_node_count;
         std::vector<std::string> ordered_nodes;
@@ -398,63 +406,42 @@ private:
             int key = base_shm_key + std::hash<std::string>{}(parent_id + "_" + server_id) % 1000;
             try
             {
-                // Attaches parent shared memory segment (as reader).
+                // Attach to parent's shared memory segment (as reader).
                 incomingShmManagers[parent_id] = std::make_unique<SharedMemoryManager>(key, false);
                 std::cout << "Child " << server_id << " attached to parent's (" << parent_id
                           << ") shared memory (key " << key << ")" << std::endl;
                 // Spawns a reader thread to drain data from this parent's outgoing channel.
                 readerThreads.emplace_back([this, parent_id]()
                                            {
-                int drainCount = 0;
                 CollisionData collision;
+                int consecutive_failures = 0;
                 while (running_) {
                     std::string msg;
                     
                     if (incomingShmManagers[parent_id]->readMessage(msg))
                     {
+                        consecutive_failures = 0;  // Reset failure counter on success
                         if (collision.ParseFromString(msg))
                         {
-
                             // For testing, we simply drain the message.
-                            drainCount++;
                             total_records_seen.fetch_add(1, std::memory_order_relaxed);
-
-                            if (drainCount % 1000 == 0)
-                            {
-                                std::cout << "Drained " << drainCount << " messages from parent's (" << parent_id << ") channel" << std::endl;
-                            }
                             size_t hash_value = getHash(collision);
                             // If this node has no children, don't attempt forwarding.
                             if (!connections.empty() && !shouldKeepLocally(hash_value))
                             {
                                 
                                 std::string target_server = chooseTargetServer(hash_value);
-                                if (!target_server.empty() && outgoingShmManagers.find(target_server) != outgoingShmManagers.end())
+                                if (!target_server.empty() && outgoingShmManagers.find(target_server) != outgoingShmManagers.end() && writeToSharedMemory(target_server, collision))
                                 {
-                                    if (writeToSharedMemory(target_server, collision))
-                                    {
-                                        // Increment forwarded counter.
-                                        std::lock_guard<std::mutex> lock(metricsMutex);
-                                        records_forwarded[target_server]++;
-
-                                        // Commented out to reduce terminal bloat
-                                        // std::cout << "Node " << server_id << " forwarded data to "
-                                        //           << target_server << " via outgoing shared memory." << std::endl;
-                                    }
-                                    else
-                                    {
-                                        std::cout << "Node " << server_id << " failed to forward data to "
-                                                  << target_server << std::endl;
-                                    }
+                                    std::lock_guard<std::mutex> lock(metricsMutex);
+                                    records_forwarded[target_server]++;
                                 }
                                 else
                                 {
-                                    // Fallback (via gRPC).
+                                    // Fallback with GRPC
                                     if (!g_simulate_grpc_failure)
                                     {
-                                        CollisionBatch batch;
-                                        *batch.add_collisions() = collision;
-                                        forwardDataToServer(target_server, batch);
+                                        forwardDataToServer(target_server, collision);
                                         {
                                             std::lock_guard<std::mutex> lock(metricsMutex);
                                             records_forwarded[target_server]++;
@@ -470,18 +457,22 @@ private:
                             }
                             else
                             {
-                                // Keep data locally
+                                collision_refs.emplace_back(collision);
                                 records_kept_locally.fetch_add(1, std::memory_order_relaxed);
-                            }
-                            // Once every 1000 messages, print the distribution report.
-                            if (drainCount % 10000 == 0)
-                            {
-                                reportDistributionStats();
+                                if (records_kept_locally % 1000 == 0)
+                                    reportDistributionStats();
+
                             }
                         }
                     }
                     else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        consecutive_failures++;
+                        // If we've had too many consecutive failures, sleep longer
+                        if (consecutive_failures > 100) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        }
                     }
                 } });
             }
@@ -492,7 +483,7 @@ private:
         }
     }
 
-    // Report distribution statistics.
+    // Report distribution statistics with additional metrics.
     void reportDistributionStats()
     {
         if (total_dataset_size == 0 && g_expected_total_dataset_size > 0)
@@ -580,6 +571,8 @@ public:
     GenericServer(const std::string &config_path)
         : entry_point_flag(false)
     {
+        collision_refs.reserve(3000000);
+
         if (g_expected_total_dataset_size > 0)
         {
             total_dataset_size = g_expected_total_dataset_size;
@@ -653,6 +646,7 @@ public:
                 t.join();
             }
         }
+        reportDistributionStats();
     }
 
     // Handle incoming collision data from Python client (entry point).
@@ -679,53 +673,43 @@ public:
                 std::cout << "Received " << count << " records" << std::endl;
             }
             size_t hash_value = getHash(collision);
-            bool keep_locally = shouldKeepLocally(hash_value);
-            if (keep_locally)
+            if (shouldKeepLocally(hash_value))
             {
+                collision_refs.emplace_back(collision);
                 records_kept_locally.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             std::string target_server = chooseTargetServer(hash_value);
-
-            if (!target_server.empty())
+            routing_stats[target_server]++;
             {
-                routing_stats[target_server]++;
+                std::lock_guard<std::mutex> lock(metricsMutex);
+                records_forwarded[target_server]++;
+            }
+            bool target_local = (network_nodes[target_server].address == network_nodes[server_id].address);
+            if (target_local && outgoingShmManagers.find(target_server) != outgoingShmManagers.end() &&
+                writeToSharedMemory(target_server, collision))
+            {
+                if (count % 500 == 0)
                 {
-                    std::lock_guard<std::mutex> lock(metricsMutex);
-                    records_forwarded[target_server]++;
-                }
-                bool target_local = (network_nodes[target_server].address == network_nodes[server_id].address);
-                if (target_local && outgoingShmManagers.find(target_server) != outgoingShmManagers.end() &&
-                    writeToSharedMemory(target_server, collision))
-                {
-                    if (count % 500 == 0)
-                    {
-                        std::cout << "Data written to shared memory for " << target_server << std::endl;
-                    }
-                }
-                else
-                {
-                    if (!g_simulate_grpc_failure)
-                    {
-                        CollisionBatch batch;
-                        *batch.add_collisions() = collision;
-                        forwardDataToServer(target_server, batch);
-                        if (count % 500 == 0)
-                        {
-                            std::cout << "Data sent via gRPC to " << target_server << std::endl;
-                        }
-                    }
-                    else
-                    {
-                        // Here for testing. In prod should be removed
-                        // std::cout << "GRPC failover off." << std::endl;
-                        // std::cout << "Data to be sent to " << target_server << " Skipped" << std::endl;
-                    }
+                    std::cout << "Data written to shared memory for " << target_server << std::endl;
                 }
             }
             else
             {
-                std::cout << "No route available, keeping record locally" << std::endl;
+                if (!g_simulate_grpc_failure)
+                {
+                    forwardDataToServer(target_server, collision);
+                    if (count % 500 == 0)
+                    {
+                        std::cout << "Data sent via gRPC to " << target_server << std::endl;
+                    }
+                }
+                else
+                {
+                    // Here for testing. In prod should this should never get hit
+                    // std::cout << "GRPC failover off." << std::endl;
+                    // std::cout << "Data to be sent to " << target_server << " Skipped" << std::endl;
+                }
             }
             if (entry_count % 1000 == 0)
             {
@@ -746,58 +730,138 @@ public:
 
     // Handles forwarded data from other servers via GRPC
     Status ForwardData(ServerContext *context,
-                       const CollisionBatch *batch,
+                       const CollisionData *collision,
                        Empty *response) override
     {
-        int batch_size = batch->collisions_size();
-        std::cout << "Node " << server_id << ": ForwardData called with "
-                  << batch->collisions_size() << " collisions." << std::endl;
-        std::cout << "Received forwarded batch with " << batch_size << " records" << std::endl;
-        total_records_seen += batch_size;
-        for (int i = 0; i < batch_size; i++)
+        total_records_seen += 1;
+        size_t hash_value = getHash(*collision);
+        if (shouldKeepLocally(hash_value) || connections.empty())
         {
-            const CollisionData &collision = batch->collisions(i);
-            size_t hash_value = getHash(collision);
-            if (shouldKeepLocally(hash_value))
+            CollisionData collision_copy = *collision;
+            collision_refs.emplace_back(collision_copy);
+            records_kept_locally++;
+            if (records_kept_locally % 1000 == 0)
+                reportDistributionStats();
+            return Status::OK;
+        }
+
+        std::string target_server = chooseTargetServer(hash_value);
+        if (!target_server.empty())
+        {
+            records_forwarded[target_server]++;
+            if (writeToSharedMemory(target_server, *collision))
             {
-                records_kept_locally++;
-                std::cout << "Record kept locally based on content hash" << std::endl;
-                continue;
+                std::cout << "Data written to shared memory for " << target_server << std::endl;
             }
-            std::string target_server = chooseTargetServer(hash_value);
-            if (!target_server.empty())
+            else
             {
-                records_forwarded[target_server]++;
-                if (writeToSharedMemory(target_server, collision))
+                if (!g_simulate_grpc_failure)
                 {
-                    std::cout << "Data written to shared memory for " << target_server << std::endl;
+                    forwardDataToServer(target_server, *collision);
                 }
                 else
                 {
-                    if (!g_simulate_grpc_failure)
-                    {
-                        CollisionBatch new_batch;
-                        *new_batch.add_collisions() = collision;
-                        forwardDataToServer(target_server, new_batch);
-                    }
-                    else
-                    {
-                        std::cout << "Record Batch Skipped" << std::endl;
-                    }
+                    std::cout << "Record Batch Skipped" << std::endl;
                 }
             }
         }
-        reportDistributionStats();
         return Status::OK;
     }
 
-    // Handle sharing of analysis results.
-    Status ShareAnalysis(ServerContext *context,
-                         const RiskAssessment *assessment,
-                         Empty *response) override
+    Status SignalCompletion(ServerContext *context,
+                            const Empty *request,
+                            Empty *response) override
     {
-        std::cout << "Received risk assessment for " << assessment->borough()
-                  << " " << assessment->zip_code() << std::endl;
+        static std::atomic<int> signal_count{0};
+        int current_count = ++signal_count;
+        std::cout << "Final signal received. Count: " << current_count << std::endl;
+
+        if (current_count < 3)
+        {
+            std::cout << "Waiting until 3 signals are received before spatial analysis...\n";
+            return Status::OK;
+        }
+
+        std::cout << "All 3 signals received. Starting spatial analysis...\n";
+        SpatialAnalysis analysis(10, 2);
+        analysis.processCollisions(collision_refs);
+        analysis.identifyHighRiskAreas();
+
+        // Here to prevent seg faults when propagating
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        for (const std::string &child_id : connections)
+        {
+            std::cout << "Propagating completion to child " << child_id << std::endl;
+            if (server_stubs.find(child_id) != server_stubs.end() && server_stubs[child_id])
+            {
+                ClientContext ctx;
+                Empty req;
+                Empty resp;
+                Status status = server_stubs[child_id]->PropagateCompletion(&ctx, req, &resp);
+                if (!status.ok())
+                {
+                    std::cerr << "Failed to propagate completion to " << child_id
+                              << ": " << status.error_message() << std::endl;
+                }
+            }
+            else
+            {
+                std::cerr << "No gRPC stub available for child " << child_id << std::endl;
+            }
+        }
+
+        reportDistributionStats();
+
+        return Status::OK;
+    }
+
+    Status PropagateCompletion(ServerContext *context,
+                               const Empty *request,
+                               Empty *response) override
+    {
+
+        {
+            // Ensure that we only process the finalization once per node.
+            std::lock_guard<std::mutex> lock(completionMutex);
+            if (completionPropagated)
+            {
+                std::cout << "Completion already processed at node " << server_id << std::endl;
+                return Status::OK;
+            }
+            completionPropagated = true;
+        }
+
+        std::cout << "Completion signal received at node " << server_id
+                  << ". Running final spatial analysis...\n";
+
+        SpatialAnalysis analysis(10, 2);
+        analysis.processCollisions(collision_refs);
+        analysis.identifyHighRiskAreas();
+
+        // Propagate the completion signal to all children nodes.
+        for (const std::string &child_id : connections)
+        {
+            std::cout << "Propagating completion to child " << child_id << std::endl;
+            if (server_stubs.find(child_id) != server_stubs.end() && server_stubs[child_id])
+            {
+                ClientContext ctx;
+                Empty req;
+                Empty resp;
+                Status status = server_stubs[child_id]->PropagateCompletion(&ctx, req, &resp);
+                if (!status.ok())
+                {
+                    std::cerr << "Failed to propagate completion to " << child_id
+                              << ": " << status.error_message() << std::endl;
+                }
+            }
+            else
+            {
+                std::cerr << "No gRPC stub available for child " << child_id << std::endl;
+            }
+        }
+
+        reportDistributionStats();
         return Status::OK;
     }
 

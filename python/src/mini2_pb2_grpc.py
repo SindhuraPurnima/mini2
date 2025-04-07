@@ -5,7 +5,7 @@ import warnings
 
 import mini2_pb2 as mini2__pb2
 
-GRPC_GENERATED_VERSION = '1.70.0'
+GRPC_GENERATED_VERSION = '1.71.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -40,9 +40,9 @@ class EntryPointServiceStub(object):
                 request_serializer=mini2__pb2.CollisionData.SerializeToString,
                 response_deserializer=mini2__pb2.Empty.FromString,
                 _registered_method=True)
-        self.SetDatasetInfo = channel.unary_unary(
-                '/mini2.EntryPointService/SetDatasetInfo',
-                request_serializer=mini2__pb2.DatasetInfo.SerializeToString,
+        self.SignalCompletion = channel.unary_unary(
+                '/mini2.EntryPointService/SignalCompletion',
+                request_serializer=mini2__pb2.Empty.SerializeToString,
                 response_deserializer=mini2__pb2.Empty.FromString,
                 _registered_method=True)
 
@@ -58,9 +58,8 @@ class EntryPointServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SetDatasetInfo(self, request, context):
-        """Add new method to set dataset size
-        """
+    def SignalCompletion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -73,9 +72,9 @@ def add_EntryPointServiceServicer_to_server(servicer, server):
                     request_deserializer=mini2__pb2.CollisionData.FromString,
                     response_serializer=mini2__pb2.Empty.SerializeToString,
             ),
-            'SetDatasetInfo': grpc.unary_unary_rpc_method_handler(
-                    servicer.SetDatasetInfo,
-                    request_deserializer=mini2__pb2.DatasetInfo.FromString,
+            'SignalCompletion': grpc.unary_unary_rpc_method_handler(
+                    servicer.SignalCompletion,
+                    request_deserializer=mini2__pb2.Empty.FromString,
                     response_serializer=mini2__pb2.Empty.SerializeToString,
             ),
     }
@@ -118,7 +117,7 @@ class EntryPointService(object):
             _registered_method=True)
 
     @staticmethod
-    def SetDatasetInfo(request,
+    def SignalCompletion(request,
             target,
             options=(),
             channel_credentials=None,
@@ -131,8 +130,8 @@ class EntryPointService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/mini2.EntryPointService/SetDatasetInfo',
-            mini2__pb2.DatasetInfo.SerializeToString,
+            '/mini2.EntryPointService/SignalCompletion',
+            mini2__pb2.Empty.SerializeToString,
             mini2__pb2.Empty.FromString,
             options,
             channel_credentials,
@@ -157,17 +156,12 @@ class InterServerServiceStub(object):
         """
         self.ForwardData = channel.unary_unary(
                 '/mini2.InterServerService/ForwardData',
-                request_serializer=mini2__pb2.CollisionBatch.SerializeToString,
+                request_serializer=mini2__pb2.CollisionData.SerializeToString,
                 response_deserializer=mini2__pb2.Empty.FromString,
                 _registered_method=True)
-        self.ShareAnalysis = channel.unary_unary(
-                '/mini2.InterServerService/ShareAnalysis',
-                request_serializer=mini2__pb2.RiskAssessment.SerializeToString,
-                response_deserializer=mini2__pb2.Empty.FromString,
-                _registered_method=True)
-        self.SetTotalDatasetSize = channel.unary_unary(
-                '/mini2.InterServerService/SetTotalDatasetSize',
-                request_serializer=mini2__pb2.DatasetInfo.SerializeToString,
+        self.PropagateCompletion = channel.unary_unary(
+                '/mini2.InterServerService/PropagateCompletion',
+                request_serializer=mini2__pb2.Empty.SerializeToString,
                 response_deserializer=mini2__pb2.Empty.FromString,
                 _registered_method=True)
 
@@ -183,16 +177,8 @@ class InterServerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ShareAnalysis(self, request, context):
-        """Share analysis results
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def SetTotalDatasetSize(self, request, context):
-        """Add new method
-        """
+    def PropagateCompletion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -202,17 +188,12 @@ def add_InterServerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'ForwardData': grpc.unary_unary_rpc_method_handler(
                     servicer.ForwardData,
-                    request_deserializer=mini2__pb2.CollisionBatch.FromString,
+                    request_deserializer=mini2__pb2.CollisionData.FromString,
                     response_serializer=mini2__pb2.Empty.SerializeToString,
             ),
-            'ShareAnalysis': grpc.unary_unary_rpc_method_handler(
-                    servicer.ShareAnalysis,
-                    request_deserializer=mini2__pb2.RiskAssessment.FromString,
-                    response_serializer=mini2__pb2.Empty.SerializeToString,
-            ),
-            'SetTotalDatasetSize': grpc.unary_unary_rpc_method_handler(
-                    servicer.SetTotalDatasetSize,
-                    request_deserializer=mini2__pb2.DatasetInfo.FromString,
+            'PropagateCompletion': grpc.unary_unary_rpc_method_handler(
+                    servicer.PropagateCompletion,
+                    request_deserializer=mini2__pb2.Empty.FromString,
                     response_serializer=mini2__pb2.Empty.SerializeToString,
             ),
     }
@@ -242,7 +223,7 @@ class InterServerService(object):
             request,
             target,
             '/mini2.InterServerService/ForwardData',
-            mini2__pb2.CollisionBatch.SerializeToString,
+            mini2__pb2.CollisionData.SerializeToString,
             mini2__pb2.Empty.FromString,
             options,
             channel_credentials,
@@ -255,7 +236,7 @@ class InterServerService(object):
             _registered_method=True)
 
     @staticmethod
-    def ShareAnalysis(request,
+    def PropagateCompletion(request,
             target,
             options=(),
             channel_credentials=None,
@@ -268,35 +249,8 @@ class InterServerService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/mini2.InterServerService/ShareAnalysis',
-            mini2__pb2.RiskAssessment.SerializeToString,
-            mini2__pb2.Empty.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def SetTotalDatasetSize(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/mini2.InterServerService/SetTotalDatasetSize',
-            mini2__pb2.DatasetInfo.SerializeToString,
+            '/mini2.InterServerService/PropagateCompletion',
+            mini2__pb2.Empty.SerializeToString,
             mini2__pb2.Empty.FromString,
             options,
             channel_credentials,

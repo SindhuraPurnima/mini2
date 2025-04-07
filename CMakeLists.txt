@@ -82,7 +82,6 @@ add_custom_target(generate_proto_files
 # Server source files
 set(SERVER_SRC
     cpp/src/server.cpp
-    cpp/src/parser/CSV.cpp
     cpp/src/SpatialAnalysis.cpp
     ${mini2_proto_srcs}
     ${mini2_grpc_srcs}
@@ -96,38 +95,6 @@ target_link_libraries(server PRIVATE
     gRPC::grpc++
     gRPC::grpc++_reflection
     protobuf::libprotobuf
-    absl::flags
-    absl::flags_parse
-    absl::flags_reflection
-    absl::base
-    absl::log
-    absl::log_initialize
-    absl::log_entry
-    absl::log_globals
-    absl::log_severity
-    absl::check
-    absl::log_internal_check_op
-    absl::log_internal_conditions
-    absl::log_internal_format
-    absl::log_internal_globals
-    absl::log_internal_log_sink_set
-    absl::log_internal_message
-    absl::log_internal_nullguard
-    absl::log_internal_proto
-    absl::log_sink
-    absl::log_sink_registry
-    absl::cord
-    absl::cordz_info
-    absl::cord_internal
-    absl::strings
-    absl::strings_internal
-    absl::symbolize
-    absl::stacktrace
-    absl::synchronization
-    absl::time
-    absl::time_zone
-    absl::status
-    absl::statusor
     Threads::Threads
 )
 
