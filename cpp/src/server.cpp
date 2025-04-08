@@ -215,7 +215,6 @@ private:
     std::atomic<int> total_records_seen{0};
     std::atomic<int> records_kept_locally{0};
     std::mutex metricsMutex; // Protects records_forwarded updates.
-    std::map<std::string, int> records_forwarded;
 
     // Total node count.
     int total_node_count;
@@ -327,6 +326,8 @@ private:
                 return true;
             }
         }
+        printf("Node %s is not the target node for hash %zu. Target node is %s.\n",
+              server_id.c_str(), hash_value, ordered_nodes[target_node_index].c_str());
         return false;
     }
 
@@ -352,6 +353,8 @@ private:
         }
         if (!connections.empty())
         {
+            printf("Target node %s is not a child of %s. Using first child %s.\n",
+                   target_node_id.c_str(), server_id.c_str(), connections[0].c_str());
             return connections[0];
         }
         return "";
@@ -434,8 +437,8 @@ private:
                                 std::string target_server = chooseTargetServer(hash_value);
                                 if (!target_server.empty() && outgoingShmManagers.find(target_server) != outgoingShmManagers.end() && writeToSharedMemory(target_server, collision))
                                 {
+                                    
                                     std::lock_guard<std::mutex> lock(metricsMutex);
-                                    records_forwarded[target_server]++;
                                 }
                                 else
                                 {
@@ -445,7 +448,6 @@ private:
                                         forwardDataToServer(target_server, collision);
                                         {
                                             std::lock_guard<std::mutex> lock(metricsMutex);
-                                            records_forwarded[target_server]++;
                                         }
                                         std::cout << "Forwarded data via gRPC to " << target_server << std::endl;
                                     }
@@ -684,7 +686,6 @@ public:
             routing_stats[target_server]++;
             {
                 std::lock_guard<std::mutex> lock(metricsMutex);
-                records_forwarded[target_server]++;
             }
             bool target_local = (network_nodes[target_server].address == network_nodes[server_id].address);
             if (target_local && outgoingShmManagers.find(target_server) != outgoingShmManagers.end() &&
@@ -749,7 +750,6 @@ public:
         std::string target_server = chooseTargetServer(hash_value);
         if (!target_server.empty())
         {
-            records_forwarded[target_server]++;
             if (writeToSharedMemory(target_server, *collision))
             {
                 std::cout << "Data written to shared memory for " << target_server << std::endl;
