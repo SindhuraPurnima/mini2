@@ -295,7 +295,7 @@ private:
         }
     }
 
-    size_t getHash(const CollisionData &data)
+    size_t getHash(CollisionData &data)
     {
         std::string key = data.borough() + data.crash_date() +
                           data.crash_time();
@@ -304,6 +304,7 @@ private:
         static std::mt19937 gen(rd());
         std::uniform_int_distribution<size_t> dis(0, 1000);
         hash_value += dis(gen);
+        data.set_hash(hash_value);
         return hash_value;
     }
 
@@ -425,7 +426,7 @@ private:
                         {
                             // For testing, we simply drain the message.
                             total_records_seen.fetch_add(1, std::memory_order_relaxed);
-                            size_t hash_value = getHash(collision);
+                            size_t hash_value = collision.hash();
                             // If this node has no children, don't attempt forwarding.
                             if (!connections.empty() && !shouldKeepLocally(hash_value))
                             {
@@ -734,7 +735,7 @@ public:
                        Empty *response) override
     {
         total_records_seen += 1;
-        size_t hash_value = getHash(*collision);
+        size_t hash_value = collision->hash();
         if (shouldKeepLocally(hash_value) || connections.empty())
         {
             CollisionData collision_copy = *collision;

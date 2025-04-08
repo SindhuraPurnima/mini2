@@ -15,7 +15,7 @@ void SpatialAnalysis::processCollisions(const std::vector<mini2::CollisionData> 
     {
         if (!row.borough().empty() && !row.zip_code().empty())
         {
-            int year = extractYear(row.crash_date());
+            int year = row.year();
             auto &areaStats = boroughZipStats[row.borough()][row.zip_code()];
 
             auto it = std::lower_bound(areaStats.yearlyStats.begin(), areaStats.yearlyStats.end(), year,

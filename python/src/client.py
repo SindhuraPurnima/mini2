@@ -17,8 +17,11 @@ class CollisionDataClient:
     def parse_collision_data(self, row):
         """Convert CSV row to CollisionData message"""
         try:
+            crash_date_str = row["CRASH DATE"]
+            year = int(crash_date_str.split("/")[2])
             collision = mini2_pb2.CollisionData(
-                crash_date=row["CRASH DATE"],
+                crash_date=crash_date_str,
+                year=year,
                 crash_time=row["CRASH TIME"],
                 borough=row["BOROUGH"],
                 zip_code=row["ZIP CODE"],
@@ -58,6 +61,7 @@ class CollisionDataClient:
                         collision = self.parse_collision_data(row)
                         if collision:
                             total_records += 1
+                            # collision.year = row["CRASH DATE"].split("/")[2]
                             yield collision
                             if total_records % batch_size == 0:
                                 print(

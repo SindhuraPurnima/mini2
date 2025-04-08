@@ -39,15 +39,7 @@ message CollisionData {
     string vehicle_type_code_4 = 28;
     string vehicle_type_code_5 = 29;
     int32 year = 30;
-}
-
-// Optimized message for analysis (similar to  Mini 1 struct)
-message AnalysisRecord {
-    string crash_date = 1;
-    string borough = 2;
-    string zip_code = 3;
-    int32 persons_injured = 4;
-    int32 persons_killed = 5;
+    uint64 hash=31;
 }
 
 // Service for Python client → Server A communication
