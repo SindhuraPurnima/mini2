@@ -1,23 +1,14 @@
 cmake_minimum_required(VERSION 3.10)
-
-# Force gcc/g++ before project declaration
-# set(CMAKE_C_COMPILER "/usr/local/bin/gcc-14" CACHE STRING "C compiler" FORCE)
-#set(CMAKE_CXX_COMPILER "/usr/local/bin/g++-14" CACHE STRING "C++ compiler" FORCE)
-
-# Force CMake to use Homebrew's Clang before declaring the project
-# set(CMAKE_C_COMPILER "/usr/local/opt/llvm/bin/clang" CACHE STRING "C compiler" FORCE)
-# set(CMAKE_CXX_COMPILER "/usr/local/opt/llvm/bin/clang++" CACHE STRING "C++ compiler" FORCE)
-
-# Set LLVM Clang-specific flags
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -nostdinc++ -I/usr/local/opt/llvm/include/c++/v1")
-# set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/usr/local/opt/llvm/lib -Wl,-rpath,/usr/local/opt/llvm/lib")
-
-
 project(Mini2)
+
+set(Python3_EXECUTABLE "/usr/local/bin/python3.12" CACHE STRING "Python 3.12 executable")
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find Python interpreter for proto generation
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # Add this line to help find abseil
 set(ABSL_PROPAGATE_CXX_STD ON)
@@ -48,11 +39,19 @@ find_program(PROTOC protoc REQUIRED)
 get_filename_component(mini2_proto "proto/mini2.proto" ABSOLUTE)
 get_filename_component(mini2_proto_path "${mini2_proto}" PATH)
 
-# Generate gRPC files 
+# Generate C++ files 
 set(mini2_proto_srcs "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/proto/mini2.pb.cc")
 set(mini2_proto_hdrs "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/proto/mini2.pb.h")
 set(mini2_grpc_srcs "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/proto/mini2.grpc.pb.cc")
 set(mini2_grpc_hdrs "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include/proto/mini2.grpc.pb.h")
+
+# Generate Python files
+set(PYTHON_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/python/src")
+file(MAKE_DIRECTORY ${PYTHON_PROTO_DIR})
+set(python_proto_srcs
+    "${PYTHON_PROTO_DIR}/mini2_pb2.py"
+    "${PYTHON_PROTO_DIR}/mini2_pb2_grpc.py"
+)
 
 # Add protobuf and gRPC targets
 add_custom_command(
@@ -70,13 +69,26 @@ add_custom_command(
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/proto/mini2.proto"
 )
 
-# Add a custom target for the generated files
+# Add Python proto generation
+add_custom_command(
+    OUTPUT ${python_proto_srcs}
+    COMMAND ${Python3_EXECUTABLE}
+    ARGS -m grpc_tools.protoc
+         -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
+         --python_out="${PYTHON_PROTO_DIR}"
+         --grpc_python_out="${PYTHON_PROTO_DIR}"
+         "${CMAKE_CURRENT_SOURCE_DIR}/proto/mini2.proto"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/proto/mini2.proto"
+)
+
+# Combined generation target
 add_custom_target(generate_proto_files
     DEPENDS
         "${mini2_proto_srcs}"
         "${mini2_proto_hdrs}"
         "${mini2_grpc_srcs}"
         "${mini2_grpc_hdrs}"
+        ${python_proto_srcs}
 )
 
 # Server source files
@@ -98,7 +110,7 @@ target_link_libraries(server PRIVATE
     Threads::Threads
 )
 
-# Make sure include_directories includes the cpp/include directory
+# Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
     ${Protobuf_INCLUDE_DIRS}
