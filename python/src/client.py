@@ -43,7 +43,7 @@ class CollisionDataClient:
     def stream_data(self, csv_file_path, start_line, end_line, batch_size=100):
         """Stream data from a specific portion of the CSV file to Server A"""
         try:
-            with open(csv_file_path, "r") as file:
+            with open(csv_file_path, "r", encoding="utf-8", errors="replace") as file:
                 csv_reader = csv.DictReader(file)
                 total_records = 0
 
@@ -54,14 +54,12 @@ class CollisionDataClient:
                 # Define a generator that reads until the end_line
                 def generate_data():
                     nonlocal total_records
-                    # Continue reading until we've processed the designated segment
                     for row in csv_reader:
                         if total_records >= (end_line - start_line):
                             break
                         collision = self.parse_collision_data(row)
                         if collision:
                             total_records += 1
-                            # collision.year = row["CRASH DATE"].split("/")[2]
                             yield collision
                             if total_records % batch_size == 0:
                                 print(

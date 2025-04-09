@@ -42,7 +42,7 @@ class CollisionDataClient:
     ):
         """Stream data from a specific portion of the CSV file to Server A"""
         try:
-            with open(csv_file_path, "r") as file:
+            with open(csv_file_path, "r", encoding="utf-8", errors="replace") as file:
                 csv_reader = csv.DictReader(file)
                 total_records = 0
 
@@ -87,7 +87,6 @@ class CollisionDataClient:
             print(f"Error: Could not find CSV file at {csv_file_path}")
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
-
 
 
 def count_data_rows(csv_file_path):
