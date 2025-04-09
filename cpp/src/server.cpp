@@ -1,22 +1,22 @@
-#include <grpcpp/grpcpp.h>
-#include <memory>
-#include <string>
-#include <vector>
-#include <map>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstring>
+#include <cstdlib>
 #include <fstream>
+#include <grpcpp/grpcpp.h>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <nlohmann/json.hpp>
+#include <string>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/types.h>
-#include <atomic>
-#include <mutex>
-#include <iostream>
-#include <cstring>
-#include <cstdlib>
-#include <nlohmann/json.hpp>
-#include <csignal>
-#include <chrono>
 #include <thread>
-#include <functional>
+#include <vector>
+
 
 #include "proto/mini2.grpc.pb.h"
 #include "proto/mini2.pb.h"
@@ -130,9 +130,10 @@ public:
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     continue;
                 }
-                std::cerr << "Shared memory buffer full after " << MAX_ATTEMPTS << " attempts." << std::endl;
+                // std::cerr << "Shared memory buffer full after " << MAX_ATTEMPTS << " attempts." << std::endl;
                 return false;
             }
+
             SharedMemorySlot &slot = buffer_->slots[write];
             slot.msg_len = msg.size();
             std::memcpy(slot.data, msg.data(), msg.size());
@@ -153,6 +154,7 @@ public:
             return false;
         }
         SharedMemorySlot &slot = buffer_->slots[read];
+
         msg.assign(slot.data, slot.msg_len);
         buffer_->header.read_index = (read + 1) % buffer_->header.capacity;
         return true;
@@ -167,13 +169,7 @@ private:
 // ---------------------------------------------------------------------------
 // Global Variables for Server
 // ---------------------------------------------------------------------------
-static int64_t g_total_client_records_sent = 0;   // Total records sent by clients.
 static int64_t g_expected_total_dataset_size = 0; // Expected total number of CSV lines.
-
-void setExpectedDatasetSize(int64_t size)
-{
-    g_expected_total_dataset_size = size;
-}
 
 // ---------------------------------------------------------------------------
 // Structures for Network Configuration
@@ -192,7 +188,6 @@ struct ProcessNode
 class GenericServer : public EntryPointService::Service, public InterServerService::Service
 {
 private:
-    std::mutex stub_mutex_;
     // Server configuration.
     std::string server_id;
     std::string server_address;
@@ -214,7 +209,6 @@ private:
     // Data distribution counters.
     std::atomic<int> total_records_seen{0};
     std::atomic<int> records_kept_locally{0};
-    std::mutex metricsMutex; // Protects records_forwarded updates.
 
     // Total node count.
     int total_node_count;
@@ -232,33 +226,20 @@ private:
     std::mutex completionMutex;
     bool completionPropagated = false;
 
+    // Node Ordering
+    std::map<std::string, int> node_index;
+
     // Write a message (serialized CollisionData) to shared memory.
     bool writeToSharedMemory(const std::string &connection_id, const CollisionData &data)
     {
         if (outgoingShmManagers.find(connection_id) == outgoingShmManagers.end())
         {
-            std::cerr << "No shared memory manager for " << connection_id << std::endl;
+            // std::cerr << "No shared memory manager for " << connection_id << std::endl;
             return false;
         }
         std::string serialized_data;
         data.SerializeToString(&serialized_data);
         return outgoingShmManagers[connection_id]->writeMessage(serialized_data);
-    }
-
-    // Read a message from shared memory and deserialize into CollisionData. Flag for removal
-    bool readFromSharedMemory(const std::string &connection_id, CollisionData &data)
-    {
-        if (incomingShmManagers.find(connection_id) == incomingShmManagers.end())
-        {
-            std::cerr << "No shared memory manager for " << connection_id << std::endl;
-            return false;
-        }
-        std::string msg;
-        if (!incomingShmManagers[connection_id]->readMessage(msg))
-        {
-            return false;
-        }
-        return data.ParseFromString(msg);
     }
 
     // Initialize a gRPC channel (stub) to another server.
@@ -296,12 +277,22 @@ private:
 
     size_t getHash(CollisionData &data)
     {
-        std::string key = data.borough() + data.crash_date() +
-                          data.crash_time();
+        std::string key;
+        if (!data.borough().empty() && !data.crash_date().empty() && !data.crash_time().empty())
+        {
+            key = data.borough() + data.crash_date() + data.crash_time();
+        }
+        else
+        {
+            static std::random_device rd;
+            static std::mt19937 gen(rd());
+            static std::uniform_int_distribution<size_t> dis(1, 1000);
+            key = "random_" + std::to_string(dis(gen));
+        }
         size_t hash_value = std::hash<std::string>{}(key);
         static std::random_device rd;
         static std::mt19937 gen(rd());
-        std::uniform_int_distribution<size_t> dis(0, 1000);
+        std::uniform_int_distribution<size_t> dis(1, 1000);
         hash_value += dis(gen);
         data.set_hash(hash_value);
         return hash_value;
@@ -310,51 +301,30 @@ private:
     // Decide whether to keep data locally based on a consistent hash.
     bool shouldKeepLocally(size_t hash_value)
     {
-        total_node_count = network_nodes.size();
+        // Compute a target index from the hash.
         int target_node_index = hash_value % total_node_count;
-        std::vector<std::string> ordered_nodes;
-        for (const auto &node_pair : network_nodes)
+        // Check if our node’s assigned index equals the target.
+        if (node_index[server_id] == target_node_index)
         {
-            ordered_nodes.push_back(node_pair.first);
+            return true;
         }
-        std::sort(ordered_nodes.begin(), ordered_nodes.end());
-
-        for (size_t i = 0; i < ordered_nodes.size(); i++)
-        {
-            if (ordered_nodes[i] == server_id && i == target_node_index)
-            {
-                return true;
-            }
-        }
-        printf("Node %s is not the target node for hash %zu. Target node is %s.\n",
-              server_id.c_str(), hash_value, ordered_nodes[target_node_index].c_str());
         return false;
     }
 
-    // Choose target server for routing.
     std::string chooseTargetServer(size_t hash_value)
     {
-        std::vector<std::string> ordered_nodes;
-        for (const auto &node_pair : network_nodes)
-        {
-            ordered_nodes.push_back(node_pair.first);
-        }
-        std::sort(ordered_nodes.begin(), ordered_nodes.end());
         int target_node_index = hash_value % total_node_count;
-        std::string target_node_id = ordered_nodes[target_node_index];
-
-        // Check if our computed target is one of our children.
-        for (const auto &conn : connections)
+        // Look through our children.
+        for (const auto &child_id : connections)
         {
-            if (conn == target_node_id)
+            if (node_index[child_id] == target_node_index)
             {
-                return conn;
+                return child_id;
             }
         }
+        // Fallback: if none of our direct children match, choose the first child if available.
         if (!connections.empty())
         {
-            printf("Target node %s is not a child of %s. Using first child %s.\n",
-                   target_node_id.c_str(), server_id.c_str(), connections[0].c_str());
             return connections[0];
         }
         return "";
@@ -419,12 +389,15 @@ private:
                                            {
                 CollisionData collision;
                 int consecutive_failures = 0;
+                
                 while (running_) {
                     std::string msg;
                     
                     if (incomingShmManagers[parent_id]->readMessage(msg))
                     {
                         consecutive_failures = 0;  // Reset failure counter on success
+                        // Log the raw message here if not already done in readMessage()
+
                         if (collision.ParseFromString(msg))
                         {
                             // For testing, we simply drain the message.
@@ -438,7 +411,6 @@ private:
                                 if (!target_server.empty() && outgoingShmManagers.find(target_server) != outgoingShmManagers.end() && writeToSharedMemory(target_server, collision))
                                 {
                                     
-                                    std::lock_guard<std::mutex> lock(metricsMutex);
                                 }
                                 else
                                 {
@@ -446,9 +418,6 @@ private:
                                     if (!g_simulate_grpc_failure)
                                     {
                                         forwardDataToServer(target_server, collision);
-                                        {
-                                            std::lock_guard<std::mutex> lock(metricsMutex);
-                                        }
                                         std::cout << "Forwarded data via gRPC to " << target_server << std::endl;
                                     }
                                     else
@@ -591,6 +560,16 @@ public:
         }
         json config;
         config_file >> config;
+
+        // Assign indices to nodes in the order they appear in the configuration.
+        int idx = 0;
+        for (const auto &node : config["network"])
+        {
+            std::string node_id = node["id"];
+            node_index[node_id] = idx;
+            idx++;
+        }
+
         server_id = config["server_id"];
         server_address = config["address"];
         server_port = config["port"];
@@ -671,10 +650,10 @@ public:
             count++;
             entry_count++;
             total_records_seen.fetch_add(1, std::memory_order_relaxed);
-            if (count % 100 == 0)
-            {
-                std::cout << "Received " << count << " records" << std::endl;
-            }
+            // if (count % 100 == 0)
+            // {
+            //     std::cout << "Received " << count << " records" << std::endl;
+            // }
             size_t hash_value = getHash(collision);
             if (shouldKeepLocally(hash_value))
             {
@@ -684,17 +663,15 @@ public:
             }
             std::string target_server = chooseTargetServer(hash_value);
             routing_stats[target_server]++;
-            {
-                std::lock_guard<std::mutex> lock(metricsMutex);
-            }
+
             bool target_local = (network_nodes[target_server].address == network_nodes[server_id].address);
             if (target_local && outgoingShmManagers.find(target_server) != outgoingShmManagers.end() &&
                 writeToSharedMemory(target_server, collision))
             {
-                if (count % 500 == 0)
-                {
-                    std::cout << "Data written to shared memory for " << target_server << std::endl;
-                }
+                // if (count % 500 == 0)
+                // {
+                //     std::cout << "Data written to shared memory for " << target_server << std::endl;
+                // }
             }
             else
             {
@@ -752,7 +729,7 @@ public:
         {
             if (writeToSharedMemory(target_server, *collision))
             {
-                std::cout << "Data written to shared memory for " << target_server << std::endl;
+                // std::cout << "Data written to shared memory for " << target_server << std::endl;
             }
             else
             {
@@ -813,7 +790,6 @@ public:
         }
 
         reportDistributionStats();
-
         return Status::OK;
     }
 
